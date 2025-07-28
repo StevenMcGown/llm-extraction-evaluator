@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic-settings
+boto3 
+asyncpg
+aiomysql
+python-multipart
+aiohttp
+python-Levenshtein 

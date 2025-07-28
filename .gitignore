@@ -1,0 +1,52 @@
+# --- General ---
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+
+# --- Editor / IDE ---
+.idea/
+.vscode/
+*.code-workspace
+
+# --- Virtual Environments ---
+venv/
+.venv/
+backend/venv/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+coverage/
+
+# --- Environment files ---
+.env
+.env.*
+
+# --- Node / Frontend ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+# Vite cache inside node_modules
+**/.vite/
+# Log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Local Development Data ---
+test_data/
+frontend/src/schema.json
+
+# --- Misc ---
+*.sqlite3
+*.db 
+
+node_modules/
