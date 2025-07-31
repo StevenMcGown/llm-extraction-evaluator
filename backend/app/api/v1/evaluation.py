@@ -157,6 +157,7 @@ class SeedGroundTruthResult(BaseModel):
 
 class RecalculateRequest(BaseModel):
     ground_truth_uri: str = Field(..., description="S3 URI to ground truth JSON files")
+    responses_uri: str = Field(..., description="S3 URI to evaluation responses (where run data is stored)")
     extraction_types: Optional[List[str]] = Field(None, description="Types of data to extract (if None, no filtering applied)")
     excluded_fields: Optional[List[str]] = Field(None, description="JSON pointer paths to exclude from evaluation")
 
@@ -280,10 +281,11 @@ async def load_evaluation_from_s3(run_id: str, responses_uri: str) -> Evaluation
                 # Load ground truth for this file
                 gt_key = f"{gt_prefix.rstrip('/')}/{file_hash}.json"
                 ground_truth_data = None
+                ground_truth_full = None
                 try:
                     gt_content = await fetch_s3_file_content(gt_bucket, gt_key)
-                    ground_truth = json.loads(gt_content.decode('utf-8'))
-                    ground_truth_data = ground_truth.get('extracted_data', ground_truth)
+                    ground_truth_full = json.loads(gt_content.decode('utf-8'))
+                    ground_truth_data = ground_truth_full.get('extracted_data', ground_truth_full)
                 except Exception as e:
                     print(f"No ground truth found for {file_hash}: {str(e)}")
                 
@@ -303,10 +305,54 @@ async def load_evaluation_from_s3(run_id: str, responses_uri: str) -> Evaluation
                     print(f"No valid responses found for {file_hash}")
                     continue
                 
-                # Get filename from first response or use hash as fallback
+                # Get filename from S3 object tags (where original filename is stored)
                 filename = file_hash  # Default fallback
-                if api_responses and 'filename' in api_responses[0]:
+                
+                # Try to get the original filename from S3 object tags
+                try:
+                    # Determine the source file bucket and prefix from config
+                    config = metadata.get('config', {})
+                    source_data_uri = config.get('source_data_uri')
+                    if source_data_uri:
+                        source_bucket, source_prefix = parse_s3_uri(source_data_uri)
+                        
+                        # Construct the likely S3 key for the source file
+                        # Try common extensions
+                        for ext in ['.pdf', '.PDF']:
+                            source_key = f"{source_prefix.rstrip('/')}/{file_hash}{ext}" if source_prefix else f"{file_hash}{ext}"
+                            try:
+                                # Get object tags to find original filename
+                                tags_response = s3_client.get_object_tagging(
+                                    Bucket=source_bucket,
+                                    Key=source_key
+                                )
+                                
+                                # Look for original_name tag
+                                for tag in tags_response.get('TagSet', []):
+                                    if tag['Key'] == 'original_name':
+                                        from urllib.parse import unquote_plus
+                                        filename = unquote_plus(tag['Value'])
+                                        print(f"Found original filename from S3 tags: {filename}")
+                                        break
+                                
+                                if filename != file_hash:
+                                    break  # Found filename, stop trying extensions
+                                    
+                            except Exception as tag_error:
+                                print(f"Could not get tags for {source_key}: {tag_error}")
+                                continue
+                
+                except Exception as e:
+                    print(f"Could not retrieve filename from S3 tags: {e}")
+                
+                # Fall back to API response filename if not found in S3 tags
+                if filename == file_hash and api_responses and 'filename' in api_responses[0]:
                     filename = api_responses[0]['filename']
+                
+                # Final fallback: if we still have file_hash, try to construct a reasonable filename
+                if filename == file_hash:
+                    # Convert hash to a PDF filename that the viewer can recognize
+                    filename = f"{file_hash}.pdf"
                 
                 # Calculate scores if ground truth exists
                 scores = {}
@@ -1334,11 +1380,16 @@ async def list_source_files(source_data_uri: str):
 
 @router.post("/recalculate-evaluation/{evaluation_id}", response_model=EvaluationResult, tags=["evaluation"])
 async def recalculate_evaluation(evaluation_id: str, request: RecalculateRequest):
-    """Recalculate metrics and scores for an existing evaluation, reloading ground truth data from S3."""
-    if evaluation_id not in evaluation_store:
-        raise HTTPException(status_code=404, detail="Evaluation not found")
+    """Recalculate metrics and scores for an existing evaluation, loading data from S3."""
     
-    result = evaluation_store[evaluation_id]
+    # Load the evaluation from S3 first
+    try:
+        result = await load_evaluation_from_s3(evaluation_id, request.responses_uri)
+    except HTTPException as e:
+        # If it's a 404, make the error more specific
+        if e.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Evaluation run '{evaluation_id}' not found in S3")
+        raise
     
     try:
         # Parse ground truth S3 URI

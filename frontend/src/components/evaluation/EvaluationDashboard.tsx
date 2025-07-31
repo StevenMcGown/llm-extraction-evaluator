@@ -346,7 +346,7 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
   };
 
   const handleRefreshCalculations = useCallback(async () => {
-    if (!currentEvaluationId || !settings.groundTruthPath) return;
+    if (!currentEvaluationId || !settings.groundTruthPath || !settings.responsesPath) return;
 
     console.log('🔄 Recalculating evaluation with current settings...');
     console.log('Extraction types:', extractionTypes);
@@ -361,7 +361,7 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
 
     setIsRefreshing(true);
     try {
-      const response = await recalculateEvaluation(currentEvaluationId, settings.groundTruthPath, extractionTypes, excludedFields);
+      const response = await recalculateEvaluation(currentEvaluationId, settings.groundTruthPath, settings.responsesPath, extractionTypes, excludedFields);
       const result = response.data;
 
       // Update the displayed data with recalculated results
@@ -379,12 +379,12 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     } finally {
       setIsRefreshing(false);
     }
-  }, [currentEvaluationId, settings.groundTruthPath, extractionTypes, excludedFields]);
+  }, [currentEvaluationId, settings.groundTruthPath, settings.responsesPath, extractionTypes, excludedFields]);
 
   // Auto-refresh calculations when excluded fields change
   useEffect(() => {
     // Only auto-refresh if we have a current evaluation and real data
-    if (!currentEvaluationId || !hasRealData || !settings.groundTruthPath) {
+    if (!currentEvaluationId || !hasRealData || !settings.groundTruthPath || !settings.responsesPath) {
       return;
     }
 
@@ -395,7 +395,7 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     }, 1000); // 1 second debounce
 
     return () => clearTimeout(timeoutId);
-  }, [excludedFields, currentEvaluationId, hasRealData, settings.groundTruthPath, handleRefreshCalculations]);
+  }, [excludedFields, currentEvaluationId, hasRealData, settings.groundTruthPath, settings.responsesPath, handleRefreshCalculations]);
 
 
 

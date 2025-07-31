@@ -70,9 +70,10 @@ export const getEvaluationResult = (evaluationId: string) =>
 export const getEvaluationFromS3 = (runId: string, responsesUri: string) => 
   apiClient.get(`/evaluation/s3/${runId}`, { params: { responses_uri: responsesUri } });
 
-export const recalculateEvaluation = (evaluationId: string, groundTruthUri: string, extractionTypes?: string[], excludedFields?: string[]) =>
+export const recalculateEvaluation = (evaluationId: string, groundTruthUri: string, responsesUri: string, extractionTypes?: string[], excludedFields?: string[]) =>
   apiClient.post(`/recalculate-evaluation/${evaluationId}`, { 
     ground_truth_uri: groundTruthUri,
+    responses_uri: responsesUri,
     extraction_types: extractionTypes,
     excluded_fields: excludedFields
   });
