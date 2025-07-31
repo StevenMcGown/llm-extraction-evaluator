@@ -67,6 +67,9 @@ export const runEvaluation = (data: {
 export const getEvaluationResult = (evaluationId: string) => 
   apiClient.get(`/evaluation/${evaluationId}`);
 
+export const getEvaluationFromS3 = (runId: string, responsesUri: string) => 
+  apiClient.get(`/evaluation/s3/${runId}`, { params: { responses_uri: responsesUri } });
+
 export const recalculateEvaluation = (evaluationId: string, groundTruthUri: string, extractionTypes?: string[], excludedFields?: string[]) =>
   apiClient.post(`/recalculate-evaluation/${evaluationId}`, { 
     ground_truth_uri: groundTruthUri,

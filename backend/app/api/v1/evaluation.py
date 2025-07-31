@@ -4,6 +4,9 @@ from __future__ import annotations
 import json
 import asyncio
 import hashlib
+import uuid
+import time
+from datetime import datetime
 from typing import Dict, List, Optional, Any, Union, Tuple
 from urllib.parse import urlparse
 import aiohttp
@@ -12,8 +15,115 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 import Levenshtein
 
+# Set up logging
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global evaluation lock to prevent concurrent evaluations
+evaluation_lock = asyncio.Lock()
+evaluation_queue = []  # Queue for pending evaluations
+
 router = APIRouter()
 s3_client = boto3.client("s3")
+
+# -------------------------------------------------------------------------
+# Helper Functions for New S3 Structure
+# -------------------------------------------------------------------------
+
+def generate_evaluation_run_id() -> str:
+    """Generate a unique evaluation run ID with timestamp."""
+    timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")
+    run_id = str(uuid.uuid4())[:8]  # First 8 chars of UUID
+    return f"{timestamp}-{run_id}"
+
+def build_s3_paths(evaluation_run_id: str, file_hash: str, iteration: int) -> Dict[str, str]:
+    """Build S3 paths for an evaluation run."""
+    base_path = f"{evaluation_run_id}"
+    
+    return {
+        "metadata": f"{base_path}/metadata.json",
+        "response": f"{base_path}/responses/{file_hash}/{iteration}.json",
+        "results": f"{base_path}/results/summary.json"
+    }
+
+async def save_evaluation_metadata_to_s3(
+    evaluation_run_id: str,
+    config: Dict[str, Any],
+    responses_uri: str
+) -> str:
+    """Save evaluation run metadata to S3."""
+    try:
+        # Parse responses S3 URI
+        responses_bucket, responses_prefix = parse_s3_uri(responses_uri)
+        
+        # Create metadata object
+        metadata = {
+            "evaluation_run_id": evaluation_run_id,
+            "created_at": datetime.utcnow().isoformat(),
+            "config": config,
+            "status": "running"
+        }
+        
+        # Create S3 key for metadata
+        if responses_prefix:
+            s3_key = f"{responses_prefix.rstrip('/')}/{evaluation_run_id}/metadata.json"
+        else:
+            s3_key = f"{evaluation_run_id}/metadata.json"
+        
+        # Convert to JSON string
+        json_content = json.dumps(metadata, indent=2)
+        
+        # Upload to S3
+        s3_client.put_object(
+            Bucket=responses_bucket,
+            Key=s3_key,
+            Body=json_content.encode('utf-8'),
+            ContentType='application/json'
+        )
+        
+        return f"s3://{responses_bucket}/{s3_key}"
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save evaluation metadata: {str(e)}")
+
+async def save_evaluation_results_to_s3(
+    evaluation_run_id: str,
+    results: Dict[str, Any],
+    responses_uri: str
+) -> str:
+    """Save evaluation results to S3."""
+    try:
+        # Parse responses S3 URI
+        responses_bucket, responses_prefix = parse_s3_uri(responses_uri)
+        
+        # Create S3 key for results
+        if responses_prefix:
+            s3_key = f"{responses_prefix.rstrip('/')}/{evaluation_run_id}/results/summary.json"
+        else:
+            s3_key = f"{evaluation_run_id}/results/summary.json"
+        
+        # Convert to JSON string
+        json_content = json.dumps(results, indent=2)
+        
+        # Upload to S3
+        s3_client.put_object(
+            Bucket=responses_bucket,
+            Key=s3_key,
+            Body=json_content.encode('utf-8'),
+            ContentType='application/json'
+        )
+        
+        return f"s3://{responses_bucket}/{s3_key}"
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save evaluation results: {str(e)}")
+
+
+
+# -------------------------------------------------------------------------
+# Existing Models
+# -------------------------------------------------------------------------
 
 class EvaluationRequest(BaseModel):
     source_data_uri: str = Field(..., description="S3 URI to source PDF files")
@@ -86,6 +196,201 @@ class EvaluationResult(BaseModel):
 # In-memory storage for evaluation results (replace with database in production)
 evaluation_store: Dict[str, EvaluationResult] = {}
 
+# -------------------------------------------------------------------------
+# S3-based evaluation loading functions
+# -------------------------------------------------------------------------
+
+async def load_evaluation_from_s3(run_id: str, responses_uri: str) -> EvaluationResult:
+    """Load evaluation results from S3 using run ID."""
+    try:
+        # Parse responses S3 URI
+        responses_bucket, responses_prefix = parse_s3_uri(responses_uri)
+        
+        # Build paths for metadata and results
+        if responses_prefix:
+            metadata_key = f"{responses_prefix.rstrip('/')}/{run_id}/metadata.json"
+            results_key = f"{responses_prefix.rstrip('/')}/{run_id}/results/summary.json"
+            responses_prefix_path = f"{responses_prefix.rstrip('/')}/{run_id}/responses/"
+        else:
+            metadata_key = f"{run_id}/metadata.json"
+            results_key = f"{run_id}/results/summary.json"
+            responses_prefix_path = f"{run_id}/responses/"
+        
+        print(f"Loading evaluation from S3:")
+        print(f"  Metadata: s3://{responses_bucket}/{metadata_key}")
+        print(f"  Results: s3://{responses_bucket}/{results_key}")
+        print(f"  Responses: s3://{responses_bucket}/{responses_prefix_path}")
+        
+        # Load metadata
+        try:
+            metadata_content = await fetch_s3_file_content(responses_bucket, metadata_key)
+            metadata = json.loads(metadata_content.decode('utf-8'))
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=f"Evaluation metadata not found for run {run_id}: {str(e)}")
+        
+        # Load results summary if available
+        try:
+            results_content = await fetch_s3_file_content(responses_bucket, results_key)
+            results_summary = json.loads(results_content.decode('utf-8'))
+        except Exception as e:
+            print(f"Results summary not found for run {run_id}: {str(e)}")
+            results_summary = None
+        
+        # Get ground truth URI from metadata
+        config = metadata.get('config', {})
+        ground_truth_uri = config.get('ground_truth_uri')
+        if not ground_truth_uri:
+            raise HTTPException(status_code=400, detail="Ground truth URI not found in evaluation metadata")
+        
+        # Parse ground truth URI
+        gt_bucket, gt_prefix = parse_s3_uri(ground_truth_uri)
+        
+        # List all response files for this run
+        response_objects = s3_client.list_objects_v2(
+            Bucket=responses_bucket, 
+            Prefix=responses_prefix_path
+        )
+        
+        documents = []
+        all_scores = []
+        all_true_negatives = []
+        
+        # Group responses by file hash
+        file_responses = {}
+        for obj in response_objects.get('Contents', []):
+            key = obj['Key']
+            if key.endswith('.json'):
+                # Extract file hash and iteration from path
+                # Path format: {prefix}/{run_id}/responses/{file_hash}/{iteration}.json
+                path_parts = key.replace(responses_prefix_path, '').split('/')
+                if len(path_parts) >= 2:
+                    file_hash = path_parts[0]
+                    iteration_file = path_parts[1]
+                    iteration = int(iteration_file.replace('.json', ''))
+                    
+                    if file_hash not in file_responses:
+                        file_responses[file_hash] = {}
+                    file_responses[file_hash][iteration] = key
+        
+        print(f"Found responses for {len(file_responses)} files")
+        
+        # Process each file's responses
+        for file_hash, iterations in file_responses.items():
+            try:
+                # Load ground truth for this file
+                gt_key = f"{gt_prefix.rstrip('/')}/{file_hash}.json"
+                ground_truth_data = None
+                try:
+                    gt_content = await fetch_s3_file_content(gt_bucket, gt_key)
+                    ground_truth = json.loads(gt_content.decode('utf-8'))
+                    ground_truth_data = ground_truth.get('extracted_data', ground_truth)
+                except Exception as e:
+                    print(f"No ground truth found for {file_hash}: {str(e)}")
+                
+                # Load all iterations for this file
+                api_responses = []
+                sorted_iterations = sorted(iterations.keys())
+                for iteration in sorted_iterations:
+                    response_key = iterations[iteration]
+                    try:
+                        response_content = await fetch_s3_file_content(responses_bucket, response_key)
+                        api_response = json.loads(response_content.decode('utf-8'))
+                        api_responses.append(api_response)
+                    except Exception as e:
+                        print(f"Failed to load response {response_key}: {str(e)}")
+                
+                if not api_responses:
+                    print(f"No valid responses found for {file_hash}")
+                    continue
+                
+                # Get filename from first response or use hash as fallback
+                filename = file_hash  # Default fallback
+                if api_responses and 'filename' in api_responses[0]:
+                    filename = api_responses[0]['filename']
+                
+                # Calculate scores if ground truth exists
+                scores = {}
+                mismatches = []
+                true_negatives = 0
+                iteration_scores = []
+                iteration_mismatches = []
+                
+                if ground_truth_data:
+                    # Apply extraction types filter if specified
+                    extraction_types = config.get('extraction_types', [])
+                    excluded_fields = config.get('excluded_fields', [])
+                    
+                    filtered_ground_truth = ground_truth_data
+                    if extraction_types:
+                        filtered_ground_truth = filter_ground_truth_by_extraction_types(filtered_ground_truth, extraction_types)
+                    if excluded_fields:
+                        filtered_ground_truth = remove_excluded_fields_from_ground_truth(filtered_ground_truth, excluded_fields)
+                    
+                    # Calculate scores for each iteration
+                    for idx, api_response in enumerate(api_responses):
+                        iter_scores, iter_mismatches, iter_true_negatives = compare_extraction_results(filtered_ground_truth, api_response)
+                        iteration_scores.append(iter_scores)
+                        iteration_mismatches.append(iter_mismatches)
+                        
+                        # Use the last iteration for main scores
+                        if idx == len(api_responses) - 1:
+                            scores = iter_scores
+                            mismatches = iter_mismatches
+                            true_negatives = iter_true_negatives
+                    
+                    if iteration_scores:
+                        all_scores.extend(iteration_scores)
+                        all_true_negatives.extend([true_negatives] * len(iteration_scores))
+                
+                # Create document evaluation
+                document_eval = DocumentEvaluation(
+                    filename=filename,
+                    file_hash=file_hash,
+                    ground_truth=filtered_ground_truth if ground_truth_data else None,
+                    api_responses=api_responses,
+                    scores=scores,
+                    mismatches=mismatches,
+                    true_negatives=true_negatives,
+                    iteration_scores=iteration_scores if ground_truth_data else None,
+                    iteration_mismatches=iteration_mismatches if ground_truth_data else None
+                )
+                
+                documents.append(document_eval)
+                
+            except Exception as e:
+                print(f"Failed to process file {file_hash}: {str(e)}")
+                continue
+        
+        # Calculate overall metrics
+        if all_scores:
+            metrics = calculate_overall_metrics(all_scores, all_true_negatives)
+        else:
+            metrics = EvaluationMetrics(
+                true_positives=0, false_positives=0, false_negatives=0, true_negatives=0,
+                precision=0.0, recall=0.0, f1_score=0.0, accuracy=0.0
+            )
+        
+        # Create evaluation result
+        result = EvaluationResult(
+            evaluation_id=run_id,
+            status="completed" if results_summary else "loaded_from_s3",
+            documents=documents,
+            metrics=metrics,
+            total_files=len(documents),
+            completed_files=len(documents),
+            total_iterations=sum(len(doc.api_responses) for doc in documents),
+            completed_iterations=sum(len(doc.api_responses) for doc in documents),
+            errors=results_summary.get('errors', []) if results_summary else []
+        )
+        
+        print(f"Successfully loaded evaluation {run_id} with {len(documents)} documents")
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load evaluation from S3: {str(e)}")
+
 def parse_s3_uri(uri: str) -> tuple[str, str]:
     """Parse S3 URI into bucket and prefix."""
     parsed = urlparse(uri)
@@ -108,20 +413,21 @@ async def fetch_s3_file_content(bucket: str, key: str) -> bytes:
 
 async def save_iteration_response_to_s3(
     response_data: Dict[str, Any], 
-    pdf_filename: str, 
+    file_hash: str,
     iteration: int, 
+    evaluation_run_id: str,
     responses_uri: str
 ) -> str:
-    """Save API response iteration to S3, mimicking the original script's file structure."""
+    """Save API response iteration to S3 using new evaluation run structure."""
     try:
         # Parse responses S3 URI
         responses_bucket, responses_prefix = parse_s3_uri(responses_uri)
         
-        # Get base filename without extension (like original script)
-        pdf_name_base = pdf_filename.rsplit('.', 1)[0] if '.' in pdf_filename else pdf_filename
-        
-        # Create S3 key: prefix/pdf_name_base/iteration.json
-        s3_key = f"{responses_prefix.rstrip('/')}/{pdf_name_base}/{iteration}.json"
+        # Create S3 key using new structure: evaluation_runs/{run_id}/responses/{file_hash}/{iteration}.json
+        if responses_prefix:
+            s3_key = f"{responses_prefix.rstrip('/')}/{evaluation_run_id}/responses/{file_hash}/{iteration}.json"
+        else:
+            s3_key = f"{evaluation_run_id}/responses/{file_hash}/{iteration}.json"
         
         # Convert response to JSON string
         json_content = json.dumps(response_data, indent=2)
@@ -478,10 +784,29 @@ def compare_extraction_results(
             
             continue
 
+        # Handle null/empty values properly
+        # Check if this is a "._empty" field (indicating null in ground truth)
+        # When flatten_json_for_comparison encounters a null value, it creates a field with "._empty" suffix
+        # and sets it to True. This indicates the ground truth expects this field to be null/missing.
+        is_empty_field = key.endswith('._empty')
+        
         # both "missing" or empty → TN
         if exp is None and act is None:
             true_negatives += 1
             scores[key] = 1.0
+            continue
+
+        # Handle null values in ground truth (._empty fields)
+        if is_empty_field and exp is True:
+            # Ground truth expects this field to be null/missing
+            if act is None or act is True:
+                # API response also has it as null/missing - this is correct
+                true_negatives += 1
+                scores[key] = 1.0
+            else:
+                # API response has a value when ground truth expects null - this is FP
+                scores[key] = -1.0
+                mismatches.append(f"[FP] {key}: unexpected='{act}' (expected null)")
             continue
 
         # FP: nothing expected, something found
@@ -490,8 +815,8 @@ def compare_extraction_results(
             mismatches.append(f"[FP] {key}: unexpected='{act}'")
             continue
 
-        # FN: something expected, nothing found
-        if exp is not None and act is None:
+        # FN: something expected, nothing found (but not for null fields)
+        if exp is not None and act is None and not is_empty_field:
             scores[key] = -2.0  # Use -2.0 to mark as FN
             mismatches.append(f"[FN] {key}: missing (expected='{exp}')")
             continue
@@ -543,205 +868,277 @@ def calculate_overall_metrics(all_scores: List[Dict[str, float]], all_true_negat
 async def run_evaluation_task(evaluation_id: str, request: EvaluationRequest):
     """Background task to run the actual evaluation."""
     try:
-        # Parse S3 URIs
-        source_bucket, source_prefix = parse_s3_uri(request.source_data_uri)
-        gt_bucket, gt_prefix = parse_s3_uri(request.ground_truth_uri)
-        
-        # List source files and get their original names from tags
-        source_response = s3_client.list_objects_v2(Bucket=source_bucket, Prefix=source_prefix)
-        print(f"Found {len(source_response.get('Contents', []))} objects in S3 bucket {source_bucket} with prefix {source_prefix}")
-        
-        all_source_files = []
-        
-        for obj in source_response.get('Contents', []):
-            print(f"Processing S3 object: {obj['Key']}")
-            if obj['Key'].endswith('.pdf'):
-                try:
-                    # Get object tags to find original_name
-                    tag_response = s3_client.get_object_tagging(Bucket=source_bucket, Key=obj['Key'])
-                    original_name = None
-                    for tag in tag_response.get('TagSet', []):
-                        if tag['Key'] == 'original_name':
-                            original_name = tag['Value']
-                            break
-                    
-                    # Use original_name if found, otherwise fall back to key name
-                    filename = original_name if original_name else obj['Key'].split('/')[-1]
-                    print(f"  Using filename: {filename} (original_name: {original_name})")
-                    all_source_files.append({
-                        'key': obj['Key'],
-                        'filename': filename
-                    })
-                except Exception as e:
-                    print(f"Failed to get tags for {obj['Key']}: {str(e)}")
-                    # Fall back to using key name if tag retrieval fails
-                    filename = obj['Key'].split('/')[-1]
-                    print(f"  Using fallback filename: {filename}")
-                    all_source_files.append({
-                        'key': obj['Key'],
-                        'filename': filename
-                    })
+        # Wait for the evaluation lock to ensure only one evaluation runs at a time
+        async with evaluation_lock:
+            # Update status to running once we acquire the lock
+            result = evaluation_store[evaluation_id]
+            result.status = "running"
+            logger.info(f"Starting evaluation {evaluation_id} - acquired lock")
+            
+            # Generate evaluation run ID if not provided
+            if not hasattr(request, 'evaluation_run_id') or not request.evaluation_run_id:
+                evaluation_run_id = generate_evaluation_run_id()
             else:
-                print(f"  Skipping non-PDF file: {obj['Key']}")
-        
-        # Filter source files based on selected_files parameter
-        print(f"Request selected_files: {request.selected_files}")
-        print(f"Available files: {[f['filename'] for f in all_source_files]}")
-        
-        if request.selected_files:
-            # Filter to only include selected files
-            selected_filenames = set(request.selected_files)
-            source_files = [file_info for file_info in all_source_files if file_info['filename'] in selected_filenames]
-            print(f"Processing {len(source_files)} selected files out of {len(all_source_files)} total files")
-            print(f"Selected files to process: {[f['filename'] for f in source_files]}")
-        else:
-            # Process all files if no selection provided
-            source_files = all_source_files
-            print(f"Processing all {len(source_files)} files (no selection provided)")
-        
-        # List ground truth files
-        gt_response = s3_client.list_objects_v2(Bucket=gt_bucket, Prefix=gt_prefix)
-        gt_files = {get_file_hash_from_key(obj['Key']): obj['Key'] 
-                   for obj in gt_response.get('Contents', []) if obj['Key'].endswith('.json')}
-        
-        # Initialize result
-        result = evaluation_store[evaluation_id]
-        result.total_files = len(source_files)
-        result.total_iterations = len(source_files) * request.iterations
-        
-        document_evaluations = []
-        all_scores = []
-        all_true_negatives = [] # Collect true negatives for overall metrics
-        
-        for file_info in source_files:
-            try:
-                source_key = file_info['key']
-                filename = file_info['filename']
-                file_hash = get_file_hash_from_key(source_key)
-                
-                # Check if ground truth exists - but don't skip if missing
-                ground_truth_data = None
-                if file_hash in gt_files:
-                    # Fetch ground truth
-                    gt_content = await fetch_s3_file_content(gt_bucket, gt_files[file_hash])
-                    ground_truth = json.loads(gt_content.decode('utf-8'))
-                    # Extract only the extracted_data part for comparison
-                    ground_truth_data = ground_truth.get('extracted_data', ground_truth)
-                else:
-                    # Log that ground truth is missing but continue processing
-                    print(f"No ground truth found for {filename} (hash: {file_hash}), proceeding with extraction only")
-                
-                # Fetch PDF content
-                pdf_content = await fetch_s3_file_content(source_bucket, source_key)
-                
-                # Run multiple iterations
-                api_responses = []
-                for iteration in range(request.iterations):
+                evaluation_run_id = request.evaluation_run_id
+            
+            # Save evaluation metadata to S3 if responses_uri is provided
+            if request.responses_uri:
+                try:
+                    metadata_config = {
+                        "source_data_uri": request.source_data_uri,
+                        "ground_truth_uri": request.ground_truth_uri,
+                        "extraction_endpoint": request.extraction_endpoint,
+                        "extraction_types": request.extraction_types,
+                        "excluded_fields": request.excluded_fields,
+                        "iterations": request.iterations,
+                        "selected_files": request.selected_files
+                    }
+                    metadata_path = await save_evaluation_metadata_to_s3(
+                        evaluation_run_id, metadata_config, request.responses_uri
+                    )
+                    print(f"Saved evaluation metadata to: {metadata_path}")
+                except Exception as metadata_error:
+                    print(f"Failed to save evaluation metadata: {str(metadata_error)}")
+            
+            # Parse S3 URIs
+            source_bucket, source_prefix = parse_s3_uri(request.source_data_uri)
+            gt_bucket, gt_prefix = parse_s3_uri(request.ground_truth_uri)
+            
+            # List source files and get their original names from tags
+            source_response = s3_client.list_objects_v2(Bucket=source_bucket, Prefix=source_prefix)
+            print(f"Found {len(source_response.get('Contents', []))} objects in S3 bucket {source_bucket} with prefix {source_prefix}")
+            
+            all_source_files = []
+            
+            for obj in source_response.get('Contents', []):
+                print(f"Processing S3 object: {obj['Key']}")
+                if obj['Key'].endswith('.pdf'):
                     try:
-                        api_response = await call_extraction_api(
-                            pdf_content, filename, request.extraction_endpoint,
-                            request.extraction_types, request.oauth_token
-                        )
-                        api_responses.append(api_response)
+                        # Get object tags to find original_name
+                        tag_response = s3_client.get_object_tagging(Bucket=source_bucket, Key=obj['Key'])
+                        original_name = None
+                        for tag in tag_response.get('TagSet', []):
+                            if tag['Key'] == 'original_name':
+                                original_name = tag['Value']
+                                break
                         
-                        # Update iteration progress
-                        result.completed_iterations += 1
-                        
-                        # Save iteration response to S3 if responses_uri is provided
-                        if request.responses_uri:
-                            try:
-                                saved_path = await save_iteration_response_to_s3(
-                                    api_response, filename, iteration + 1, request.responses_uri
-                                )
-                                print(f"Saved iteration {iteration + 1} response to: {saved_path}")
-                            except Exception as save_error:
-                                result.errors.append(f"Failed to save iteration {iteration + 1} for {filename}: {str(save_error)}")
-                        
+                        # Use original_name if found, otherwise fall back to key name
+                        filename = original_name if original_name else obj['Key'].split('/')[-1]
+                        print(f"  Using filename: {filename} (original_name: {original_name})")
+                        all_source_files.append({
+                            'key': obj['Key'],
+                            'filename': filename
+                        })
                     except Exception as e:
-                        result.errors.append(f"Iteration {iteration + 1} failed for {filename}: {str(e)}")
-                
-                if not api_responses:
-                    result.errors.append(f"All iterations failed for {filename}")
-                    continue
-                
-                # Calculate scores and mismatches for each iteration if ground truth exists
-                scores = {}
-                mismatches = []
-                true_negatives = 0
-                iteration_scores = []
-                iteration_mismatches = []
-                
-                if ground_truth_data:
-                    # Filter ground truth based on selected extraction types
-                    filtered_ground_truth = filter_ground_truth_by_extraction_types(ground_truth_data, request.extraction_types)
+                        print(f"Failed to get tags for {obj['Key']}: {str(e)}")
+                        # Fall back to using key name if tag retrieval fails
+                        filename = obj['Key'].split('/')[-1]
+                        print(f"  Using fallback filename: {filename}")
+                        all_source_files.append({
+                            'key': obj['Key'],
+                            'filename': filename
+                        })
+                else:
+                    print(f"  Skipping non-PDF file: {obj['Key']}")
+            
+            # Filter source files based on selected_files parameter
+            print(f"Available files: {[f['filename'] for f in all_source_files]}")
+            
+            if request.selected_files:
+                # Filter to only include selected files
+                selected_filenames = set(request.selected_files)
+                source_files = [file_info for file_info in all_source_files if file_info['filename'] in selected_filenames]
+                print(f"Processing {len(source_files)} selected files out of {len(all_source_files)} total files")
+                print(f"Selected files to process: {[f['filename'] for f in source_files]}")
+            else:
+                # Process all files if no selection provided
+                source_files = all_source_files
+                print(f"Processing all {len(source_files)} files (no selection provided)")
+            
+            # List ground truth files
+            gt_response = s3_client.list_objects_v2(Bucket=gt_bucket, Prefix=gt_prefix)
+            gt_files = {get_file_hash_from_key(obj['Key']): obj['Key'] 
+                       for obj in gt_response.get('Contents', []) if obj['Key'].endswith('.json')}
+            
+            # Initialize result
+            result = evaluation_store[evaluation_id]
+            result.total_files = len(source_files)
+            result.total_iterations = len(source_files) * request.iterations
+            
+            document_evaluations = []
+            all_scores = []
+            all_true_negatives = [] # Collect true negatives for overall metrics
+            
+            for file_info in source_files:
+                try:
+                    source_key = file_info['key']
+                    filename = file_info['filename']
+                    file_hash = get_file_hash_from_key(source_key)
                     
-                    # Remove excluded fields from ground truth
-                    if request.excluded_fields is not None:
-                        filtered_ground_truth = remove_excluded_fields_from_ground_truth(filtered_ground_truth, request.excluded_fields)
+                    logger.info(f"Processing file: {filename} (hash: {file_hash})")
                     
-                    # Calculate scores for each iteration
-                    for idx, api_response in enumerate(api_responses):
-                        # Also apply exclusions to API response for fair comparison
+                    # Check if ground truth exists - but don't skip if missing
+                    ground_truth_data = None
+                    if file_hash in gt_files:
+                        # Fetch ground truth
+                        gt_content = await fetch_s3_file_content(gt_bucket, gt_files[file_hash])
+                        ground_truth = json.loads(gt_content.decode('utf-8'))
+                        # Extract only the extracted_data part for comparison
+                        ground_truth_data = ground_truth.get('extracted_data', ground_truth)
+                    else:
+                        # Log that ground truth is missing but continue processing
+                        print(f"No ground truth found for {filename} (hash: {file_hash}), proceeding with extraction only")
+                    
+                    # Fetch PDF content
+                    pdf_content = await fetch_s3_file_content(source_bucket, source_key)
+                    
+                    # Run multiple iterations
+                    api_responses = []
+                    for iteration in range(request.iterations):
+                        try:
+                            logger.info(f"Running iteration {iteration + 1} for {filename}")
+                            api_response = await call_extraction_api(
+                                pdf_content, filename, request.extraction_endpoint,
+                                request.extraction_types, request.oauth_token
+                            )
+                            api_responses.append(api_response)
+                            logger.info(f"Completed iteration {iteration + 1} for {filename}")
+                            
+                            # Update iteration progress
+                            result.completed_iterations += 1
+                            
+                            # Save iteration response to S3 if responses_uri is provided
+                            if request.responses_uri:
+                                try:
+                                    saved_path = await save_iteration_response_to_s3(
+                                        api_response, file_hash, iteration + 1, evaluation_run_id, request.responses_uri
+                                    )
+                                    print(f"Saved iteration {iteration + 1} response to: {saved_path}")
+                                except Exception as save_error:
+                                    result.errors.append(f"Failed to save iteration {iteration + 1} for {filename}: {str(save_error)}")
+                            
+                        except Exception as e:
+                            logger.error(f"Iteration {iteration + 1} failed for {filename}: {str(e)}")
+                            result.errors.append(f"Iteration {iteration + 1} failed for {filename}: {str(e)}")
+                    
+                    if not api_responses:
+                        result.errors.append(f"All iterations failed for {filename}")
+                        continue
+
+                    # Calculate scores and mismatches for each iteration if ground truth exists
+                    scores = {}
+                    mismatches = []
+                    true_negatives = 0
+                    iteration_scores = []
+                    iteration_mismatches = []
+                    
+                    if ground_truth_data:
+                        # Filter ground truth based on selected extraction types
+                        filtered_ground_truth = filter_ground_truth_by_extraction_types(ground_truth_data, request.extraction_types)
+                        
+                        # Remove excluded fields from ground truth
                         if request.excluded_fields is not None:
-                            api_extracted_data = api_response.get("extracted_data", api_response)
-                            filtered_api_extracted_data = filter_ground_truth_by_extraction_types(
-                                api_extracted_data, request.extraction_types
-                            )
-                            filtered_api_extracted_data = remove_excluded_fields_from_ground_truth(
-                                filtered_api_extracted_data, request.excluded_fields
-                            )
-                            filtered_api_response = {"extracted_data": filtered_api_extracted_data}
-                            iter_scores, iter_mismatches, iter_true_negatives = compare_extraction_results(filtered_ground_truth, filtered_api_response)
-                        else:
-                            iter_scores, iter_mismatches, iter_true_negatives = compare_extraction_results(filtered_ground_truth, api_response)
-                    # Add iteration info to mismatches
-                        iter_mismatches = [f"[{filename} | Iter {idx + 1}] {mismatch}" for mismatch in iter_mismatches]
+                            filtered_ground_truth = remove_excluded_fields_from_ground_truth(filtered_ground_truth, request.excluded_fields)
                         
-                        iteration_scores.append(iter_scores)
-                        iteration_mismatches.append(iter_mismatches)
-                        
-                        # Use the last iteration for the main scores (backward compatibility)
-                        if idx == len(api_responses) - 1:
-                            scores = iter_scores
-                            mismatches = iter_mismatches
-                            true_negatives = iter_true_negatives
-                
-                document_eval = DocumentEvaluation(
-                    filename=filename,
-                    file_hash=file_hash,
-                    ground_truth=filtered_ground_truth if ground_truth_data else None,  # Use filtered ground truth
-                    api_responses=api_responses,
-                    scores=scores,  # Will be empty dict if no ground truth
-                    mismatches=mismatches,  # Will be empty list if no ground truth
-                    true_negatives=true_negatives,
-                    iteration_scores=iteration_scores if ground_truth_data else None,
-                    iteration_mismatches=iteration_mismatches if ground_truth_data else None
-                )
-                
-                document_evaluations.append(document_eval)
-                
-                if iteration_scores:
-                    all_scores.extend(iteration_scores)
-                    # For true negatives, replicate per iteration count
-                    all_true_negatives.extend([true_negatives] * len(iteration_scores))
-                elif scores:
-                    # Fallback if iteration_scores is empty (no GT)
-                    all_scores.append(scores)
-                all_true_negatives.append(true_negatives)
-                
-                result.completed_files += 1
-                
-            except Exception as e:
-                result.errors.append(f"Failed to evaluate {filename} ({source_key}): {str(e)}")
-        
-        # Calculate overall metrics
-        result.metrics = calculate_overall_metrics(all_scores, all_true_negatives)
-        result.documents = document_evaluations
-        result.status = "completed"
-        
+                        # Calculate scores for each iteration
+                        for idx, api_response in enumerate(api_responses):
+                            # Also apply exclusions to API response for fair comparison
+                            if request.excluded_fields is not None:
+                                api_extracted_data = api_response.get("extracted_data", api_response)
+                                filtered_api_extracted_data = filter_ground_truth_by_extraction_types(
+                                    api_extracted_data, request.extraction_types
+                                )
+                                filtered_api_extracted_data = remove_excluded_fields_from_ground_truth(
+                                    filtered_api_extracted_data, request.excluded_fields
+                                )
+                                filtered_api_response = {"extracted_data": filtered_api_extracted_data}
+                                iter_scores, iter_mismatches, iter_true_negatives = compare_extraction_results(filtered_ground_truth, filtered_api_response)
+                            else:
+                                iter_scores, iter_mismatches, iter_true_negatives = compare_extraction_results(filtered_ground_truth, api_response)
+                        # Add iteration info to mismatches
+                            iter_mismatches = [f"[{filename} | Iter {idx + 1}] {mismatch}" for mismatch in iter_mismatches]
+                            
+                            iteration_scores.append(iter_scores)
+                            iteration_mismatches.append(iter_mismatches)
+                            
+                            # Use the last iteration for the main scores (backward compatibility)
+                            if idx == len(api_responses) - 1:
+                                scores = iter_scores
+                                mismatches = iter_mismatches
+                                true_negatives = iter_true_negatives
+                    
+                    document_eval = DocumentEvaluation(
+                        filename=filename,
+                        file_hash=file_hash,
+                        ground_truth=filtered_ground_truth if ground_truth_data else None,  # Use filtered ground truth
+                        api_responses=api_responses,
+                        scores=scores,  # Will be empty dict if no ground truth
+                        mismatches=mismatches,  # Will be empty list if no ground truth
+                        true_negatives=true_negatives,
+                        iteration_scores=iteration_scores if ground_truth_data else None,
+                        iteration_mismatches=iteration_mismatches if ground_truth_data else None
+                    )
+                    
+                    document_evaluations.append(document_eval)
+                    
+                    if iteration_scores:
+                        all_scores.extend(iteration_scores)
+                        # For true negatives, replicate per iteration count
+                        all_true_negatives.extend([true_negatives] * len(iteration_scores))
+                    elif scores:
+                        # Fallback if iteration_scores is empty (no GT)
+                        all_scores.append(scores)
+                    all_true_negatives.append(true_negatives)
+                    
+                    result.completed_files += 1
+                    
+                except Exception as e:
+                    result.errors.append(f"Failed to evaluate {filename} ({source_key}): {str(e)}")
+            
+            # Calculate overall metrics
+            result.metrics = calculate_overall_metrics(all_scores, all_true_negatives)
+            result.documents = document_evaluations
+            result.status = "completed"
+            
+            logger.info(f"Evaluation {evaluation_id} completed successfully - releasing lock")
+            
+            # Save final results to S3 if responses_uri is provided
+            if request.responses_uri:
+                try:
+                    final_results = {
+                        "evaluation_run_id": evaluation_run_id,
+                        "evaluation_id": evaluation_id,
+                        "status": result.status,
+                        "metrics": result.metrics.dict(),
+                        "total_files": result.total_files,
+                        "completed_files": result.completed_files,
+                        "total_iterations": result.total_iterations,
+                        "completed_iterations": result.completed_iterations,
+                        "errors": result.errors,
+                        "completed_at": datetime.utcnow().isoformat(),
+                        "config": {
+                            "source_data_uri": request.source_data_uri,
+                            "ground_truth_uri": request.ground_truth_uri,
+                            "extraction_endpoint": request.extraction_endpoint,
+                            "extraction_types": request.extraction_types,
+                            "excluded_fields": request.excluded_fields,
+                            "iterations": request.iterations,
+                            "selected_files": request.selected_files
+                        }
+                    }
+                    results_path = await save_evaluation_results_to_s3(
+                        evaluation_run_id, final_results, request.responses_uri
+                    )
+                    print(f"Saved evaluation results to: {results_path}")
+                except Exception as results_error:
+                    print(f"Failed to save evaluation results: {str(results_error)}")
+                    result.errors.append(f"Failed to save results to S3: {str(results_error)}")
+            
     except Exception as e:
+        result = evaluation_store[evaluation_id]
         result.status = "failed"
         result.errors.append(f"Evaluation failed: {str(e)}")
+        logger.error(f"Evaluation {evaluation_id} failed: {str(e)} - releasing lock")
 
 @router.post("/run-evaluation/", response_model=dict, tags=["evaluation"])
 async def run_evaluation(request: EvaluationRequest, background_tasks: BackgroundTasks):
@@ -750,10 +1147,17 @@ async def run_evaluation(request: EvaluationRequest, background_tasks: Backgroun
     # Generate evaluation ID
     evaluation_id = hashlib.md5(f"{request.source_data_uri}{request.ground_truth_uri}{request.iterations}".encode()).hexdigest()
     
+    # Check if evaluation lock is currently held
+    lock_acquired = evaluation_lock.locked()
+    if lock_acquired:
+        logger.info(f"Evaluation {evaluation_id} queued - another evaluation is currently running")
+    else:
+        logger.info(f"Evaluation {evaluation_id} starting - no queue")
+    
     # Initialize evaluation result
     evaluation_store[evaluation_id] = EvaluationResult(
         evaluation_id=evaluation_id,
-        status="running",
+        status="queued" if lock_acquired else "running",
         documents=[],
         metrics=EvaluationMetrics(
             true_positives=0, false_positives=0, false_negatives=0, true_negatives=0,
@@ -769,7 +1173,41 @@ async def run_evaluation(request: EvaluationRequest, background_tasks: Backgroun
     # Start background evaluation task
     background_tasks.add_task(run_evaluation_task, evaluation_id, request)
     
-    return {"evaluation_id": evaluation_id, "status": "started"}
+    return {
+        "evaluation_id": evaluation_id, 
+        "status": "queued" if lock_acquired else "started",
+        "message": "Evaluation queued - another evaluation is running" if lock_acquired else "Evaluation started"
+    }
+
+@router.get("/evaluation-status/", response_model=dict, tags=["evaluation"])
+async def get_evaluation_status():
+    """Get the current status of the evaluation system (running/queue info)."""
+    
+    lock_held = evaluation_lock.locked()
+    running_evaluations = []
+    queued_evaluations = []
+    
+    # Find running and queued evaluations
+    for eval_id, result in evaluation_store.items():
+        if result.status == "running":
+            running_evaluations.append({
+                "evaluation_id": eval_id,
+                "completed_files": result.completed_files,
+                "total_files": result.total_files,
+                "completed_iterations": result.completed_iterations,
+                "total_iterations": result.total_iterations
+            })
+        elif result.status == "queued":
+            queued_evaluations.append({
+                "evaluation_id": eval_id
+            })
+    
+    return {
+        "lock_held": lock_held,
+        "running_evaluations": running_evaluations,
+        "queued_evaluations": queued_evaluations,
+        "queue_length": len(queued_evaluations)
+    }
 
 @router.get("/evaluation/{evaluation_id}", response_model=EvaluationResult, tags=["evaluation"])
 async def get_evaluation_result(evaluation_id: str):
@@ -793,6 +1231,11 @@ async def list_evaluations():
             for eval_id, result in evaluation_store.items()
         ]
     }
+
+@router.get("/evaluation/s3/{run_id}", response_model=EvaluationResult, tags=["evaluation"])
+async def get_evaluation_from_s3(run_id: str, responses_uri: str):
+    """Load evaluation results from S3 using run ID."""
+    return await load_evaluation_from_s3(run_id, responses_uri)
 
 @router.post("/seed-ground-truth/", response_model=SeedGroundTruthResult, tags=["evaluation"])
 async def seed_ground_truth(request: SeedGroundTruthRequest):

@@ -80,7 +80,7 @@ const ApplicationSettings: React.FC<ApplicationSettingsProps> = ({ isDarkMode })
 
         <div>
           <SectionHeader isDarkMode={isDarkMode}>
-            Responses URI
+            Evaluation Runs URI
           </SectionHeader>
           <input
             type="text"

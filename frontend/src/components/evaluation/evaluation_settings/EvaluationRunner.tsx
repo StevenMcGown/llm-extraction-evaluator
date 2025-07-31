@@ -111,13 +111,46 @@ const EvaluationRunner: React.FC = () => {
     return await response.json();
   };
 
-  const saveResponse = async (job: ExtractionJob, extractionResult: any, runNumber: number) => {
+  const generateEvaluationRunId = () => {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const runId = Math.random().toString(36).substring(2, 10);
+    return `${timestamp}-${runId}`;
+  };
+
+  const saveEvaluationMetadata = async (evaluationRunId: string) => {
+    const responsesData = parseS3Uri(settings.responsesPath);
+    const metadata = {
+      evaluation_run_id: evaluationRunId,
+      created_at: new Date().toISOString(),
+      config: {
+        source_data_uri: settings.sourceDataPath,
+        responses_uri: settings.responsesPath,
+        extraction_endpoint: settings.extractionEndpoint,
+        extraction_types: ['patient_profile', 'icd10_codes', 'medications', 'allergy'],
+        iterations: 1, // Frontend currently only does 1 iteration per job
+        selected_files: jobs.map(job => job.fileName)
+      },
+      status: 'running'
+    };
+    
+    const prefix = responsesData.prefix ? (responsesData.prefix.endsWith('/') ? responsesData.prefix : responsesData.prefix + '/') : '';
+    const metadataKey = `${prefix}evaluation_runs/${evaluationRunId}/metadata.json`;
+    
+    try {
+      await uploadGroundTruth(responsesData.bucket, metadataKey, JSON.stringify(metadata, null, 2));
+      console.log('Saved evaluation metadata to:', metadataKey);
+    } catch (error) {
+      console.error('Failed to save evaluation metadata:', error);
+    }
+  };
+
+  const saveResponse = async (job: ExtractionJob, extractionResult: any, runNumber: number, evaluationRunId: string) => {
     const responsesData = parseS3Uri(settings.responsesPath);
     const fileHash = getFileHashFromKey(job.fileKey);
     
-    // Build key: responses/{fileHash}/{runNumber}.json
+    // Build key using new structure: evaluation_runs/{runId}/responses/{fileHash}/{runNumber}.json
     const prefix = responsesData.prefix ? (responsesData.prefix.endsWith('/') ? responsesData.prefix : responsesData.prefix + '/') : '';
-    const responseKey = `${prefix}${fileHash}/${runNumber}.json`;
+    const responseKey = `${prefix}evaluation_runs/${evaluationRunId}/responses/${fileHash}/${runNumber}.json`;
     
     await uploadGroundTruth(responsesData.bucket, responseKey, JSON.stringify(extractionResult));
   };
@@ -130,6 +163,13 @@ const EvaluationRunner: React.FC = () => {
 
     setIsRunning(true);
     setError(null);
+
+    // Generate evaluation run ID for this batch
+    const evaluationRunId = generateEvaluationRunId();
+    console.log('Starting evaluation run:', evaluationRunId);
+
+    // Save evaluation metadata
+    await saveEvaluationMetadata(evaluationRunId);
 
     for (let i = 0; i < jobs.length; i++) {
       const job = jobs[i];
@@ -147,7 +187,7 @@ const EvaluationRunner: React.FC = () => {
         const runNumber = 1; // For now, start with 1. Could be enhanced to check existing runs.
         
         // Save response
-        await saveResponse(job, extractionResult, runNumber);
+        await saveResponse(job, extractionResult, runNumber, evaluationRunId);
 
         // Update job status to completed
         setJobs(prev => prev.map((j, idx) => 
@@ -219,7 +259,7 @@ const EvaluationRunner: React.FC = () => {
             Please configure your settings in the <strong>Settings</strong> tab before running evaluations.
           </p>
           <p style={{ margin: 0, fontSize: '0.9rem', color: '#856404' }}>
-            Required: Source Data URI, Responses URI, and Extraction Endpoint
+            Required: Source Data URI, Evaluation Runs URI, and Extraction Endpoint
           </p>
         </div>
       ) : (

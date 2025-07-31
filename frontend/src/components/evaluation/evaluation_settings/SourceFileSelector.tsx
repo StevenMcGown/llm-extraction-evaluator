@@ -1,5 +1,6 @@
 import React from 'react';
 import SectionHeader from '../../common/SectionHeader';
+import FileUploader from '../../FileUploader';
 
 interface SourceFileSelectorProps {
   sourceFiles: string[];
@@ -17,6 +18,12 @@ const SourceFileSelector: React.FC<SourceFileSelectorProps> = ({
   return (
     <div>
       <SectionHeader isDarkMode={isDarkMode}>Source Files</SectionHeader>
+      
+      {/* File Uploader */}
+      <div style={{ marginBottom: '1rem' }}>
+        <FileUploader />
+      </div>
+      
       <div
         style={{
           maxHeight: 200,

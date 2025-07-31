@@ -1,9 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import MetricsOverview from './metrics_overview/MetricsOverview';
 import DocumentResultsViewer from './evaluation_results/DocumentResultsViewer';
 import SimilarityLegend, { SimilarityLegendItem } from './evaluation_results/SimilarityLegend';
 import { useSettings } from '../../context/SettingsContext';
-import { runEvaluation, getEvaluationResult, listEvaluations, listSourceFiles, recalculateEvaluation } from '../../services/api';
+import { runEvaluation, getEvaluationResult, getEvaluationFromS3, listEvaluations, listSourceFiles, recalculateEvaluation } from '../../services/api';
 // add import after others
 import EvaluationSettings from './evaluation_settings/EvaluationSettings';
 
@@ -94,9 +94,10 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
   const [selectedFiles, setSelectedFiles] = useState<string[]>([]);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [refreshTimestamp, setRefreshTimestamp] = useState<number>(Date.now());
-
-
-
+  
+  // State for loading evaluations by run ID
+  const [runIdInput, setRunIdInput] = useState<string>('');
+  const [isLoadingRunId, setIsLoadingRunId] = useState<boolean>(false);
 
 
   // Load existing evaluations on component mount
@@ -202,6 +203,11 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     console.log('Total files found:', result.total_files);
     console.log('Completed files:', result.completed_files);
 
+    // Set current evaluation ID if available in result
+    if (result.evaluation_id) {
+      setCurrentEvaluationId(result.evaluation_id);
+    }
+
     // Convert backend format to frontend format
     const mappedDocuments: DocumentResult[] = result.documents.map((doc: any) => ({
       filename: doc.filename,
@@ -241,7 +247,38 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     setError(null);
   };
 
+  const loadEvaluationByRunId = async () => {
+    if (!runIdInput.trim()) {
+      setError('Please enter a run ID');
+      return;
+    }
 
+    if (!settings.responsesPath) {
+      setError('Please configure the Evaluation Runs URI in settings');
+      return;
+    }
+
+    setIsLoadingRunId(true);
+    setError(null);
+
+    try {
+      console.log('Loading evaluation by run ID:', runIdInput);
+      const response = await getEvaluationFromS3(runIdInput.trim(), settings.responsesPath);
+      const result = response.data;
+      
+      console.log('Loaded evaluation from S3:', result);
+      loadEvaluationData(result);
+      setHasRealData(true);
+      
+      // Clear the input after successful load
+      setRunIdInput('');
+    } catch (error: any) {
+      console.error('Failed to load evaluation by run ID:', error);
+      setError(error.response?.data?.detail || `Failed to load evaluation with run ID: ${runIdInput}`);
+    } finally {
+      setIsLoadingRunId(false);
+    }
+  };
 
   const startEvaluation = async () => {
     if (!settings.sourceDataPath || !settings.groundTruthPath || !settings.extractionEndpoint) {
@@ -308,7 +345,7 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     return (value * 100).toFixed(1) + '%';
   };
 
-  const handleRefreshCalculations = async () => {
+  const handleRefreshCalculations = useCallback(async () => {
     if (!currentEvaluationId || !settings.groundTruthPath) return;
 
     console.log('🔄 Recalculating evaluation with current settings...');
@@ -342,7 +379,25 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     } finally {
       setIsRefreshing(false);
     }
-  };
+  }, [currentEvaluationId, settings.groundTruthPath, extractionTypes, excludedFields]);
+
+  // Auto-refresh calculations when excluded fields change
+  useEffect(() => {
+    // Only auto-refresh if we have a current evaluation and real data
+    if (!currentEvaluationId || !hasRealData || !settings.groundTruthPath) {
+      return;
+    }
+
+    // Debounce the refresh to avoid too many API calls
+    const timeoutId = setTimeout(() => {
+      console.log('🔄 Auto-refreshing calculations due to schema field changes...');
+      handleRefreshCalculations();
+    }, 1000); // 1 second debounce
+
+    return () => clearTimeout(timeoutId);
+  }, [excludedFields, currentEvaluationId, hasRealData, settings.groundTruthPath, handleRefreshCalculations]);
+
+
 
   const similarityLegend = [
     { range: '1.0', color: '#28a745', description: 'Perfect Match' },
@@ -453,14 +508,58 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
       {documents.length > 0 && (
         <>
           {/* Metrics Overview */}
-          <h1 style={{
-            margin: '0 0 1.5rem 0',
-            color: isDarkMode ? '#ffffff' : '#1e293b',
-            fontSize: '1.25rem',
-            fontWeight: '600'
-          }}>
-            Metrics Overview
-          </h1>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.5rem' }}>
+            <h1 style={{
+              margin: '0',
+              color: isDarkMode ? '#ffffff' : '#1e293b',
+              fontSize: '1.25rem',
+              fontWeight: '600'
+            }}>
+              Metrics Overview
+            </h1>
+            
+            {/* Load Evaluation by Run ID */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <input
+                type="text"
+                placeholder="Enter Run ID (e.g., 2024-01-15T10-30-45-abc123)"
+                value={runIdInput}
+                onChange={(e) => setRunIdInput(e.target.value)}
+                onKeyPress={(e) => e.key === 'Enter' && loadEvaluationByRunId()}
+                style={{
+                  padding: '0.5rem',
+                  borderRadius: '6px',
+                  border: `1px solid ${isDarkMode ? '#374151' : '#d1d5db'}`,
+                  background: isDarkMode ? '#374151' : 'white',
+                  color: isDarkMode ? '#ffffff' : '#111827',
+                  fontSize: '0.875rem',
+                  width: '300px'
+                }}
+                disabled={isLoadingRunId}
+              />
+              <button
+                onClick={loadEvaluationByRunId}
+                disabled={isLoadingRunId || !runIdInput.trim()}
+                style={{
+                  padding: '0.5rem 1rem',
+                  borderRadius: '6px',
+                  border: 'none',
+                  background: isLoadingRunId || !runIdInput.trim() 
+                    ? (isDarkMode ? '#4b5563' : '#e5e7eb') 
+                    : (isDarkMode ? '#3b82f6' : '#2563eb'),
+                  color: isLoadingRunId || !runIdInput.trim() 
+                    ? (isDarkMode ? '#9ca3af' : '#9ca3af') 
+                    : 'white',
+                  fontSize: '0.875rem',
+                  fontWeight: '500',
+                  cursor: isLoadingRunId || !runIdInput.trim() ? 'not-allowed' : 'pointer',
+                  whiteSpace: 'nowrap'
+                }}
+              >
+                {isLoadingRunId ? 'Loading...' : 'Load Evaluation'}
+              </button>
+            </div>
+          </div>
           {hasRealData && (
             <div style={{ marginBottom: '2rem' }}>
               <MetricsOverview

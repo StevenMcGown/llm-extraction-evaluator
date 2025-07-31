@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
+import logging
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -15,6 +16,10 @@ from pydantic import BaseModel
 import io
 import json
 import traceback
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -62,29 +67,63 @@ async def upload_pdf(file: UploadFile = File(...)):
     content = await file.read()
     file_hash = hashlib.sha256(content).hexdigest()
     
+    # Log file details for debugging
+    logger.info(f"PDF Upload - Filename: {file.filename}, Hash: {file_hash}")
+    
     pool = await _pool()
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
-            # Check if file already exists
+            # Check if file already exists in database
             await cur.execute("SELECT file_id, original_name, s3_key, uploaded_at FROM files WHERE file_hash = %s", (file_hash,))
             existing = await cur.fetchone()
             
             if existing:
-                # File already exists - return existing record
-                return FileResponse(
-                    file_id=existing[0],
-                    file_hash=file_hash,
-                    original_name=existing[1],
-                    s3_key=existing[2],
-                    uploaded_at=str(existing[3]),
-                    is_duplicate=True
-                )
+                # File exists in database - check if it actually exists in S3
+                existing_s3_key = existing[2]
+                try:
+                    s3_client.head_object(Bucket=S3_BUCKET, Key=existing_s3_key)
+                    logger.info(f"File exists in both database and S3 - File ID: {existing[0]}")
+                    # File exists in both DB and S3 - return existing record
+                    return FileResponse(
+                        file_id=existing[0],
+                        file_hash=file_hash,
+                        original_name=existing[1],
+                        s3_key=existing[2],
+                        uploaded_at=str(existing[3]),
+                        is_duplicate=True
+                    )
+                except Exception as e:
+                    # File exists in DB but not in S3 - re-upload to S3
+                    logger.warning(f"File exists in database but not in S3 - re-uploading. File ID: {existing[0]}, S3 Key: {existing_s3_key}")
+                    try:
+                        from urllib.parse import quote_plus
+                        s3_client.put_object(
+                            Bucket=S3_BUCKET,
+                            Key=existing_s3_key,
+                            Body=content,
+                            ContentType=file.content_type or "application/pdf",
+                            Tagging=f"original_name={quote_plus(file.filename)}"
+                        )
+                        logger.info(f"S3 re-upload successful for {file.filename}")
+                        return FileResponse(
+                            file_id=existing[0],
+                            file_hash=file_hash,
+                            original_name=existing[1],
+                            s3_key=existing[2],
+                            uploaded_at=str(existing[3]),
+                            is_duplicate=False  # Not a duplicate since we had to re-upload
+                        )
+                    except Exception as s3_error:
+                        logger.error(f"S3 re-upload failed for {file.filename}: {str(s3_error)}")
+                        raise HTTPException(status_code=500, detail=f"S3 re-upload failed: {str(s3_error)}")
             
             # New file - generate UUID and S3 key (store under source_files/ to allow future non-PDF types)
             file_id = str(uuid.uuid4())
             _, ext = os.path.splitext(file.filename)
             ext = ext.lower() or '.dat'
             s3_key = f"source_files/{file_hash}{ext}"
+            
+            logger.info(f"Uploading new file to S3 - Key: {s3_key}")
             
             # Upload to S3
             try:
@@ -96,7 +135,9 @@ async def upload_pdf(file: UploadFile = File(...)):
                     ContentType=file.content_type or "application/pdf",
                     Tagging=f"original_name={quote_plus(file.filename)}"
                 )
+                logger.info(f"S3 upload successful for {file.filename}")
             except Exception as e:
+                logger.error(f"S3 upload failed for {file.filename}: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"S3 upload failed: {str(e)}")
             
             # Insert into database
@@ -109,6 +150,8 @@ async def upload_pdf(file: UploadFile = File(...)):
             # Get the inserted record
             await cur.execute("SELECT uploaded_at FROM files WHERE file_id = %s", (file_id,))
             uploaded_at = await cur.fetchone()
+            
+            logger.info(f"File successfully uploaded and stored - File ID: {file_id}")
     
     pool.close(); await pool.wait_closed()
     
@@ -138,6 +181,9 @@ async def upload_any_file(file: UploadFile = File(...), target_uri: str | None =
     _, ext = os.path.splitext(file.filename)
     ext = ext.lower()
 
+    # Log file details for debugging
+    logger.info(f"File Upload - Filename: {file.filename}, Hash: {file_hash}, Extension: {ext}")
+
     # Determine bucket/prefix
     if target_uri and target_uri.startswith("s3://"):
         from urllib.parse import urlparse
@@ -150,23 +196,56 @@ async def upload_any_file(file: UploadFile = File(...), target_uri: str | None =
         bucket_override = S3_BUCKET
         prefix_override = "source_files/"
 
+    logger.info(f"Target bucket: {bucket_override}, prefix: {prefix_override}")
+
     pool = await _pool()
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute("SELECT file_id, original_name, s3_key, uploaded_at FROM files WHERE file_hash = %s", (file_hash,))
             existing = await cur.fetchone()
             if existing:
-                return FileResponse(
-                    file_id=existing[0],
-                    file_hash=file_hash,
-                    original_name=existing[1],
-                    s3_key=existing[2],
-                    uploaded_at=str(existing[3]),
-                    is_duplicate=True,
-                )
+                # File exists in database - check if it actually exists in S3
+                existing_s3_key = existing[2]
+                try:
+                    s3_client.head_object(Bucket=bucket_override, Key=existing_s3_key)
+                    logger.info(f"File exists in both database and S3 - File ID: {existing[0]}, Original name: {existing[1]}")
+                    return FileResponse(
+                        file_id=existing[0],
+                        file_hash=file_hash,
+                        original_name=existing[1],
+                        s3_key=existing[2],
+                        uploaded_at=str(existing[3]),
+                        is_duplicate=True,
+                    )
+                except Exception as e:
+                    # File exists in DB but not in S3 - re-upload to S3
+                    logger.warning(f"File exists in database but not in S3 - re-uploading. File ID: {existing[0]}, S3 Key: {existing_s3_key}")
+                    try:
+                        from urllib.parse import quote_plus
+                        s3_client.put_object(
+                            Bucket=bucket_override,
+                            Key=existing_s3_key,
+                            Body=content,
+                            ContentType=file.content_type or "application/octet-stream",
+                            Tagging=f"original_name={quote_plus(file.filename)}"
+                        )
+                        logger.info(f"S3 re-upload successful for {file.filename}")
+                        return FileResponse(
+                            file_id=existing[0],
+                            file_hash=file_hash,
+                            original_name=existing[1],
+                            s3_key=existing[2],
+                            uploaded_at=str(existing[3]),
+                            is_duplicate=False  # Not a duplicate since we had to re-upload
+                        )
+                    except Exception as s3_error:
+                        logger.error(f"S3 re-upload failed for {file.filename}: {str(s3_error)}")
+                        raise HTTPException(status_code=500, detail=f"S3 re-upload failed: {str(s3_error)}")
 
             file_id = str(uuid.uuid4())
             s3_key = f"{prefix_override}{file_hash}{ext}"
+
+            logger.info(f"Uploading new file to S3 - Key: {s3_key}")
 
             try:
                 from urllib.parse import quote_plus
@@ -177,7 +256,9 @@ async def upload_any_file(file: UploadFile = File(...), target_uri: str | None =
                     ContentType=file.content_type or "application/octet-stream",
                     Tagging=f"original_name={quote_plus(file.filename)}"
                 )
+                logger.info(f"S3 upload successful for {file.filename}")
             except Exception as e:
+                logger.error(f"S3 upload failed for {file.filename}: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"S3 upload failed: {str(e)}")
 
             await cur.execute(
@@ -188,6 +269,8 @@ async def upload_any_file(file: UploadFile = File(...), target_uri: str | None =
 
             await cur.execute("SELECT uploaded_at FROM files WHERE file_id = %s", (file_id,))
             uploaded_at = await cur.fetchone()
+
+            logger.info(f"File successfully uploaded and stored - File ID: {file_id}")
 
     pool.close(); await pool.wait_closed()
 
