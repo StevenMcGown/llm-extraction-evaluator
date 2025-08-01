@@ -22,6 +22,11 @@ export interface EvaluationSettingsProps {
   progressText: string;
   evaluationStatus: string;
   isDarkMode: boolean;
+  // Load Evaluation props
+  runIdInput: string;
+  setRunIdInput: (v: string) => void;
+  isLoadingRunId: boolean;
+  loadEvaluationByRunId: () => void;
 }
 
 const EvaluationSettings: React.FC<EvaluationSettingsProps> = ({
@@ -40,6 +45,10 @@ const EvaluationSettings: React.FC<EvaluationSettingsProps> = ({
   progressText,
   evaluationStatus,
   isDarkMode,
+  runIdInput,
+  setRunIdInput,
+  isLoadingRunId,
+  loadEvaluationByRunId,
 }) => {
   const { settings } = useSettings();
 
@@ -103,7 +112,7 @@ const EvaluationSettings: React.FC<EvaluationSettingsProps> = ({
             backgroundColor: isDarkMode ? '#374151' : '#e5e7eb', 
             margin: '1.5rem 0' 
           }} />
-          
+
           <SourceFileSelector 
             sourceFiles={sourceFiles}
             selectedFiles={selectedFiles}
@@ -113,31 +122,85 @@ const EvaluationSettings: React.FC<EvaluationSettingsProps> = ({
         </div>
       </div>
 
-      {/* start button & status */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
-        <button
-          disabled={
-            isRunningEvaluation ||
-            !settings.sourceDataPath ||
-            !settings.groundTruthPath ||
-            !settings.extractionEndpoint ||
-            selectedFiles.length === 0
-          }
-          onClick={startEvaluation}
-          style={{
-            padding: '0.75rem 1.5rem',
-            borderRadius: 8,
-            background: isRunningEvaluation ? '#6b7280' : '#3b82f6',
-            color: '#fff',
-            border: 'none',
-            cursor: isRunningEvaluation ? 'not-allowed' : 'pointer',
-          }}
-        >
-          {isRunningEvaluation ? 'Running…' : 'Start Evaluation'}
-        </button>
-        {evaluationStatus && (
-          <div style={{ fontStyle: 'italic', fontSize: 14 }}>Status: {evaluationStatus}</div>
-        )}
+      {/* start button & load evaluation controls */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', flexWrap: 'wrap', gap: '1rem' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+          <button
+            disabled={
+              isRunningEvaluation ||
+              !settings.sourceDataPath ||
+              !settings.groundTruthPath ||
+              !settings.extractionEndpoint ||
+              selectedFiles.length === 0
+            }
+            onClick={startEvaluation}
+            style={{
+              padding: '0.75rem 1.5rem',
+              borderRadius: 8,
+              background: isRunningEvaluation ? '#6b7280' : '#3b82f6',
+              color: '#fff',
+              border: 'none',
+              cursor: isRunningEvaluation ? 'not-allowed' : 'pointer',
+            }}
+          >
+            {isRunningEvaluation ? 'Running…' : 'Start Evaluation'}
+          </button>
+          {evaluationStatus && (
+            <div style={{ fontStyle: 'italic', fontSize: 14 }}>Status: {evaluationStatus}</div>
+          )}
+        </div>
+
+        {/* Load Evaluation by Run ID */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', alignItems: 'flex-end' }}>
+          <div style={{
+            color: isDarkMode ? '#ffffff' : '#495057',
+            fontSize: '0.875rem',
+            fontWeight: '600',
+            textAlign: 'right'
+          }}>
+            Load Evaluation from S3
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <input
+              type="text"
+              placeholder="Enter Run ID (e.g., 2024-01-15T10-30-45-abc123)"
+              value={runIdInput}
+              onChange={(e) => setRunIdInput(e.target.value)}
+              onKeyPress={(e) => e.key === 'Enter' && loadEvaluationByRunId()}
+              style={{
+                padding: '0.5rem',
+                borderRadius: '6px',
+                border: `1px solid ${isDarkMode ? '#374151' : '#d1d5db'}`,
+                background: isDarkMode ? '#374151' : 'white',
+                color: isDarkMode ? '#ffffff' : '#111827',
+                fontSize: '0.875rem',
+                width: '280px'
+              }}
+              disabled={isLoadingRunId}
+            />
+            <button
+              onClick={loadEvaluationByRunId}
+              disabled={isLoadingRunId || !runIdInput.trim()}
+              style={{
+                padding: '0.5rem 1rem',
+                borderRadius: '6px',
+                border: 'none',
+                background: isLoadingRunId || !runIdInput.trim() 
+                  ? (isDarkMode ? '#4b5563' : '#e5e7eb') 
+                  : (isDarkMode ? '#3b82f6' : '#2563eb'),
+                color: isLoadingRunId || !runIdInput.trim() 
+                  ? (isDarkMode ? '#9ca3af' : '#9ca3af') 
+                  : 'white',
+                fontSize: '0.875rem',
+                fontWeight: '500',
+                cursor: isLoadingRunId || !runIdInput.trim() ? 'not-allowed' : 'pointer',
+                whiteSpace: 'nowrap'
+              }}
+            >
+              {isLoadingRunId ? 'Loading...' : 'Load Evaluation'}
+            </button>
+          </div>
+        </div>
       </div>
 
       {(isRunningEvaluation || progressPercent > 0) && (

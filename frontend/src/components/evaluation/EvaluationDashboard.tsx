@@ -468,6 +468,10 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
         progressText={progressText}
         evaluationStatus={evaluationStatus}
         isDarkMode={isDarkMode}
+        runIdInput={runIdInput}
+        setRunIdInput={setRunIdInput}
+        isLoadingRunId={isLoadingRunId}
+        loadEvaluationByRunId={loadEvaluationByRunId}
       />
 
       {/* Mock Data Warning - only show if no real data */}
@@ -508,7 +512,7 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
       {documents.length > 0 && (
         <>
           {/* Metrics Overview */}
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.5rem' }}>
+          <div style={{ marginBottom: '1.5rem' }}>
             <h1 style={{
               margin: '0',
               color: isDarkMode ? '#ffffff' : '#1e293b',
@@ -517,48 +521,6 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
             }}>
               Metrics Overview
             </h1>
-            
-            {/* Load Evaluation by Run ID */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <input
-                type="text"
-                placeholder="Enter Run ID (e.g., 2024-01-15T10-30-45-abc123)"
-                value={runIdInput}
-                onChange={(e) => setRunIdInput(e.target.value)}
-                onKeyPress={(e) => e.key === 'Enter' && loadEvaluationByRunId()}
-                style={{
-                  padding: '0.5rem',
-                  borderRadius: '6px',
-                  border: `1px solid ${isDarkMode ? '#374151' : '#d1d5db'}`,
-                  background: isDarkMode ? '#374151' : 'white',
-                  color: isDarkMode ? '#ffffff' : '#111827',
-                  fontSize: '0.875rem',
-                  width: '300px'
-                }}
-                disabled={isLoadingRunId}
-              />
-              <button
-                onClick={loadEvaluationByRunId}
-                disabled={isLoadingRunId || !runIdInput.trim()}
-                style={{
-                  padding: '0.5rem 1rem',
-                  borderRadius: '6px',
-                  border: 'none',
-                  background: isLoadingRunId || !runIdInput.trim() 
-                    ? (isDarkMode ? '#4b5563' : '#e5e7eb') 
-                    : (isDarkMode ? '#3b82f6' : '#2563eb'),
-                  color: isLoadingRunId || !runIdInput.trim() 
-                    ? (isDarkMode ? '#9ca3af' : '#9ca3af') 
-                    : 'white',
-                  fontSize: '0.875rem',
-                  fontWeight: '500',
-                  cursor: isLoadingRunId || !runIdInput.trim() ? 'not-allowed' : 'pointer',
-                  whiteSpace: 'nowrap'
-                }}
-              >
-                {isLoadingRunId ? 'Loading...' : 'Load Evaluation'}
-              </button>
-            </div>
           </div>
           {hasRealData && (
             <div style={{ marginBottom: '2rem' }}>
