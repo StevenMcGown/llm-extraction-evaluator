@@ -93,48 +93,48 @@ const DocumentResultsViewer: React.FC<Props> = ({
   // Check if a field path is excluded
   const isFieldExcluded = (fieldPath: string): boolean => {
     if (!excludedFields || excludedFields.length === 0) return false;
-    
+
     // Convert dot notation path to JSON pointer format for comparison
     const jsonPointer = '/' + fieldPath.replace(/\./g, '/').replace(/\[(\d+)\]/g, '/$1');
-    
+
     const isExcluded = excludedFields.some(excludedPath => {
       // Exact match
       if (jsonPointer === excludedPath) {
         return true;
       }
-      
+
       // Child of excluded path
       if (jsonPointer.startsWith(excludedPath + '/')) {
         return true;
       }
-      
+
       // Wildcard pattern matching:
       // `/medications/medications/frequency` should match `/medications/medications/0/frequency`
       // Strategy: Remove array indices from both paths and compare
       const normalizeForWildcard = (path: string) => path.replace(/\/\d+/g, '');
-      
+
       const normalizedField = normalizeForWildcard(jsonPointer);
       const normalizedExcluded = normalizeForWildcard(excludedPath);
-      
-             if (normalizedField === normalizedExcluded) {
-         return true;
-       }
-       
-       // Also check if the excluded path is a pattern that matches this specific field
-       // e.g., excluded=/medications/medications/frequency should match field=/medications/medications/0/frequency
-       if (!excludedPath.includes('/0/') && !excludedPath.includes('/1/') && !excludedPath.includes('/2/')) {
-         // This looks like a wildcard pattern, try to match it against the specific field
-         const regex = new RegExp('^' + excludedPath.replace(/\//g, '\\/') + '$');
-         const fieldWithWildcard = jsonPointer.replace(/\/\d+/g, '');
-         
-         if (regex.test(fieldWithWildcard)) {
-           return true;
-         }
-       }
-      
+
+      if (normalizedField === normalizedExcluded) {
+        return true;
+      }
+
+      // Also check if the excluded path is a pattern that matches this specific field
+      // e.g., excluded=/medications/medications/frequency should match field=/medications/medications/0/frequency
+      if (!excludedPath.includes('/0/') && !excludedPath.includes('/1/') && !excludedPath.includes('/2/')) {
+        // This looks like a wildcard pattern, try to match it against the specific field
+        const regex = new RegExp('^' + excludedPath.replace(/\//g, '\\/') + '$');
+        const fieldWithWildcard = jsonPointer.replace(/\/\d+/g, '');
+
+        if (regex.test(fieldWithWildcard)) {
+          return true;
+        }
+      }
+
       return false;
     });
-    
+
     return isExcluded;
   };
 
@@ -195,14 +195,14 @@ const DocumentResultsViewer: React.FC<Props> = ({
     const onMouseMove = (e: MouseEvent) => {
       // Only update if we're actually dragging (mouse button is down)
       if (!isDragging) return;
-      
+
       const dx = e.clientX - startX;
       const dy = e.clientY - startY;
       const deltaPct = (dx / containerW) * 100;
 
       let { gt, api, pdf } = startWidths;
       const toggles = getPanelToggles(filename);
-      
+
       if (corner === 'gt-api') {
         const MIN = 20;
         const pdfMin = toggles.pdf ? MIN : 0;
@@ -220,21 +220,21 @@ const DocumentResultsViewer: React.FC<Props> = ({
         let newApi = startWidths.api;
         if (toggles.api) {
           const apiShrinkable = startWidths.api - MIN;
-          const takeFromApi   = Math.min(apiShrinkable, shrink);
-          newApi  -= takeFromApi;
-          shrink  -= takeFromApi;
+          const takeFromApi = Math.min(apiShrinkable, shrink);
+          newApi -= takeFromApi;
+          shrink -= takeFromApi;
         }
 
         // 4) then shrink PDF if needed
         let newPdf = toggles.pdf ? startWidths.pdf : 0;
         if (toggles.pdf && shrink > 0) {
           const pdfShrinkable = startWidths.pdf - pdfMin;
-          const takeFromPdf   = Math.min(pdfShrinkable, shrink);
+          const takeFromPdf = Math.min(pdfShrinkable, shrink);
           newPdf -= takeFromPdf;
           shrink -= takeFromPdf;
         }
 
-        gt  = newGt;
+        gt = newGt;
         api = newApi;
         pdf = newPdf;
       } else {
@@ -372,7 +372,7 @@ const DocumentResultsViewer: React.FC<Props> = ({
       const updated = documents.map(d => d.filename === origFilename ? { ...d, groundTruth: parsed } : d);
       setDocuments(updated);
       setIsEditing(prev => ({ ...prev, [origFilename]: false }));
-      
+
       // Automatically refresh calculations after saving ground truth
       if (onGroundTruthSaved) {
         onGroundTruthSaved();
@@ -425,24 +425,78 @@ const DocumentResultsViewer: React.FC<Props> = ({
     return '#dc3545';
   };
 
-  // Parse mismatches into a map of full paths -> type ('FP' | 'FN')
-  const buildMismatchMap = (mismatches: string[]): Record<string, 'FP' | 'FN'> => {
-    const map: Record<string, 'FP' | 'FN'> = {};
-    mismatches.forEach(m => {
-      const match = m.match(/\[(FP|FN)\]\s+([^:]+)/i);
-      if (match) {
-        const type = match[1].toUpperCase() as 'FP' | 'FN';
-        const path = match[2].trim();
-        map[path] = type;
+  // --- new types for clarity ---
+  type HighlightType = 'FP' | 'FN';
 
-        // Also try path without array indices for frontend matching
-        const pathNoIndices = path.replace(/\[\d+\]/g, '');
-        if (pathNoIndices !== path) {
-          map[pathNoIndices] = type;
+  interface ValueBasedHighlight {
+    type: HighlightType;
+    basePathRe: RegExp; // pattern to match paths irrespective of numeric indices
+    bracketValue: string;
+  }
+
+  interface MismatchInfo {
+    pathMap: Record<string, HighlightType>; // exact / normalised path matches
+    valueBased: ValueBasedHighlight[];      // med_name-style bracketed value matches
+  }
+
+  // Replacement for buildMismatchMap – now value-aware
+  const buildMismatchInfo = (mismatches: string[]): MismatchInfo => {
+    const pathMap: Record<string, HighlightType> = {};
+    const valueBased: ValueBasedHighlight[] = [];
+
+    const escapeForRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    mismatches.forEach(m => {
+      const typeMatch = m.match(/\]\s+\[(FP|FN)\]\s+/i);
+      const pathMatch = m.match(/\]\s+\[(FP|FN)\]\s+([^:]+):/); // path after the FP/FN tag
+      if (!typeMatch || !pathMatch) return;
+
+      const type = typeMatch[1].toUpperCase() as HighlightType;
+      const rawPath = pathMatch[2].trim(); // e.g., "medications.medications[||].med_name[cefpodoxime]"
+
+      // Does it have a bracketed value at the end?
+      const bracketMatch = rawPath.match(/([^\.\[\]]+)\[([^\]]+)\]$/);
+      if (bracketMatch) {
+        // Value-specific mismatch: do NOT put into pathMap
+        const bracketValue = bracketMatch[2]; // e.g., "cefpodoxime"
+        // Base path without trailing bracketed value
+        const baseField = rawPath.replace(/\[([^\]]+)\]$/, '');
+
+        // Use sentinel approach for predictable escaping
+        const sentinel = '__ARRAY_IDX__';
+        const withSentinel = baseField.replace('[||]', sentinel);
+        let regexStr = '^' + escapeForRegex(withSentinel).replace(sentinel, '\\[\\d+\\]') + '$';
+
+        try {
+          const basePathRe = new RegExp(regexStr);
+          // eslint-disable-next-line no-console
+          console.log('ValueBased entry:', { type, regexStr, bracketValue });
+          valueBased.push({ type, basePathRe, bracketValue });
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn('Failed to compile value-based regex', regexStr, err);
+        }
+      } else {
+        // Generic path-level mismatch → populate pathMap (normalized)
+        // 1) Strip ALL bracketed segments so both numeric and token variants normalize
+        const strippedAllBrackets = rawPath.replace(/\[[^\]]+\]/g, '');
+        if (!pathMap[strippedAllBrackets]) {
+          pathMap[strippedAllBrackets] = type;
+          // eslint-disable-next-line no-console
+          console.log('Adding to pathMap', { key: strippedAllBrackets, type });
+        }
+
+        // 2) Variant that preserves numeric indices but removes non-numeric brackets (optional safety net)
+        const withoutNonNumeric = rawPath.replace(/\[[^\d\]]+\]/g, '');
+        if (!pathMap[withoutNonNumeric]) {
+          pathMap[withoutNonNumeric] = type;
+          // eslint-disable-next-line no-console
+          console.log('Adding to pathMap', { key: withoutNonNumeric, type });
         }
       }
     });
-    return map;
+
+    return { pathMap, valueBased };
   };
 
   // Resolve score for a JSON path, falling back to a version with array indices stripped
@@ -502,11 +556,11 @@ const DocumentResultsViewer: React.FC<Props> = ({
     return filtered;
   };
 
-  // Enhanced renderer: keys colored by presence (green if matched, special colors if FP/FN), values by similarity score
+  // Enhanced renderer: highlights both by exact path and by value matches within bracketed mismatch descriptions
   const renderJsonScore = (
     data: any,
     scores: Record<string, number>,
-    highlightMap: Record<string, 'FP' | 'FN'> = {},
+    mismatchInfo: MismatchInfo = { pathMap: {}, valueBased: [] },
     groundTruthData: any = {},
     path: string = '',
     showMissingKeys: boolean = true
@@ -514,107 +568,98 @@ const DocumentResultsViewer: React.FC<Props> = ({
     if (typeof data !== 'object' || data === null) {
       return <span>{JSON.stringify(data)}</span>;
     }
+
     if (Array.isArray(data)) {
       return (
         <span>
           [
           {data.map((v, i) => (
             <div key={i} style={{ paddingLeft: 16 }}>
-              {renderJsonScore(v, scores, highlightMap, groundTruthData, `${path}[${i}]`, showMissingKeys)}{i < data.length - 1 && ','}
+              {renderJsonScore(v, scores, mismatchInfo, groundTruthData, `${path}[${i}]`, showMissingKeys)}
+              {i < data.length - 1 && ','}
             </div>
           ))}
           ]
         </span>
       );
     }
+
     return (
       <span>
         {'{'}
         {(() => {
-          // Get keys from data, and optionally from ground truth if showMissingKeys is true
           const dataKeys = Object.keys(data || {});
-
           let allKeys = dataKeys;
           if (showMissingKeys) {
-            // Get ground truth keys at the current path level
             let gtKeys: string[] = [];
-            if (groundTruthData) {
-              const gtAtPath = path ? getValueAtPath(groundTruthData, path) : groundTruthData;
-              if (gtAtPath && typeof gtAtPath === 'object' && !Array.isArray(gtAtPath)) {
-                gtKeys = Object.keys(gtAtPath);
-              }
+            const gtAtPath = path ? getValueAtPath(groundTruthData, path) : groundTruthData;
+            if (gtAtPath && typeof gtAtPath === 'object' && !Array.isArray(gtAtPath)) {
+              gtKeys = Object.keys(gtAtPath);
             }
             allKeys = [...new Set([...dataKeys, ...gtKeys])];
           }
 
           return allKeys.map((k, idx) => {
             const v = data?.[k];
-            const isKeyMissing = !(k in (data || {}));
-
             const full = path ? `${path}.${k}` : k;
+            const normalizedFull = full.replace(/\[\d+\]/g, '');
             const score = resolveScore(full, scores);
-            const highlight = highlightMap[full];
 
-            // Get the corresponding value from ground truth for comparison
-            const gtValue = getValueAtPath(groundTruthData, full);
-            const valuesAreIdentical = JSON.stringify(v) === JSON.stringify(gtValue);
-            const keyExistsInBoth = gtValue !== undefined;
+            let highlight: HighlightType | undefined;
 
-            // Check if this field is excluded
-            const fieldIsExcluded = isFieldExcluded(full);
-            
-            // Key styling: green if present in both (default), otherwise based on FP/FN, grayed out if excluded
-            let keyStyle: React.CSSProperties | undefined;
-            if (fieldIsExcluded) {
-              // Gray out excluded fields
-              keyStyle = {
-                color: isDarkMode ? '#6b7280' : '#9ca3af',
-                fontWeight: 'normal',
-                opacity: 0.6
-              };
-            } else if (highlight === 'FN' || isKeyMissing) {
-              // Purple highlighting for false negatives (missing fields)
-              keyStyle = {
-                backgroundColor: '#8b5cf620',
-                padding: '0 4px',
-                color: '#8b5cf6',
-                fontWeight: 'bold'
-              };
-            } else if (highlight === 'FP') {
-              keyStyle = {
-                backgroundColor: 'rgba(255,179,179,0.25)',
-                padding: '0 4px',
-                color: '#ef4444',
-                fontWeight: 'bold'
-              };
-            } else {
-              // Key exists in both - always green
-              keyStyle = {
-                color: '#28a745',
-                fontWeight: 'bold'
-              };
+            // First: value-based (bracketed) matches
+            if (v != null && typeof v !== 'object') {
+              const valStr = String(v).toLowerCase();
+              for (const entry of mismatchInfo.valueBased) {
+                if (entry.basePathRe.test(full) && valStr === entry.bracketValue.toLowerCase()) {
+                  highlight = entry.type;
+                  break;
+                }
+              }
             }
 
-            // Value styling based on similarity score
+            // Fallback: exact / normalized pathMap matches
+            if (!highlight) {
+              if (mismatchInfo.pathMap[full]) {
+                highlight = mismatchInfo.pathMap[full];
+              } else if (mismatchInfo.pathMap[normalizedFull]) {
+                highlight = mismatchInfo.pathMap[normalizedFull];
+              }
+            }
+ 
+            // DEBUG LOGGING: print any resolved FP/FN highlight for inspection
+            if (highlight === 'FP' || highlight === 'FN') {
+              // eslint-disable-next-line no-console
+              console.log(`🎨 [${highlight}]`, { path: full, value: v, normalizedPath: normalizedFull });
+            }
+
+            const gtValue = getValueAtPath(groundTruthData, full);
+            const valuesAreIdentical = JSON.stringify(v) === JSON.stringify(gtValue);
+            const fieldIsExcluded = isFieldExcluded(full);
+
+            // Key styling
+            let keyStyle: React.CSSProperties | undefined;
+            if (fieldIsExcluded) {
+              keyStyle = { color: isDarkMode ? '#6b7280' : '#9ca3af', fontWeight: 'normal', opacity: 0.6 };
+            } else if (highlight === 'FN') {
+              keyStyle = { backgroundColor: '#8b5cf620', padding: '0 4px', color: '#8b5cf6', fontWeight: 'bold' };
+            } else if (highlight === 'FP') {
+              keyStyle = { backgroundColor: 'rgba(255,179,179,0.25)', padding: '0 4px', color: '#ef4444', fontWeight: 'bold' };
+            } else if (score === undefined || score >= 0.99 || valuesAreIdentical) {
+              keyStyle = { color: '#28a745', fontWeight: 'bold' };
+            } else {
+              keyStyle = { color: isDarkMode ? '#d1d5db' : '#374151', fontWeight: 'normal' };
+            }
+
+            // Value styling
             let valueStyle: React.CSSProperties | undefined;
             if (fieldIsExcluded) {
-              // Gray out excluded field values
-              valueStyle = {
-                color: isDarkMode ? '#6b7280' : '#9ca3af',
-                fontWeight: 'normal',
-                opacity: 0.6
-              };
-            } else if (isKeyMissing) {
-              // Purple styling for missing values
-              valueStyle = { backgroundColor: '#8b5cf620', padding: '0 4px', fontStyle: 'italic', color: '#8b5cf6', fontWeight: 'bold' };
+              valueStyle = { color: isDarkMode ? '#6b7280' : '#9ca3af', fontWeight: 'normal', opacity: 0.6 };
             } else if (highlight === 'FN') {
-              // Purple styling for false negatives in ground truth
               valueStyle = { backgroundColor: '#8b5cf620', padding: '0 4px', color: '#8b5cf6', fontWeight: 'bold' };
             } else if (highlight === 'FP') {
-              // Red styling for false positives
               valueStyle = { backgroundColor: 'rgba(255,179,179,0.25)', padding: '0 4px', color: '#ef4444', fontWeight: 'bold' };
             } else if (score === undefined || score >= 0.99 || valuesAreIdentical) {
-              // Treat as perfect match if undefined (score not provided) or >=0.99
               valueStyle = { color: '#28a745', fontWeight: 'bold' };
             } else {
               const color = getScoreColor(score);
@@ -624,9 +669,9 @@ const DocumentResultsViewer: React.FC<Props> = ({
             return (
               <div key={`${full}-${idx}`} style={{ paddingLeft: 16 }}>
                 <span style={keyStyle}>{JSON.stringify(k)}</span>: {typeof v === 'object' ? (
-                  renderJsonScore(v, scores, highlightMap, groundTruthData, full, showMissingKeys)
+                  renderJsonScore(v, scores, mismatchInfo, groundTruthData, full, showMissingKeys)
                 ) : (
-                  <span style={valueStyle}>{isKeyMissing ? '' : JSON.stringify(v)}</span>
+                  <span style={valueStyle}>{JSON.stringify(v)}</span>
                 )}{idx < allKeys.length - 1 && ','}
               </div>
             );
@@ -636,6 +681,7 @@ const DocumentResultsViewer: React.FC<Props> = ({
       </span>
     );
   };
+
 
   if (documents.length === 0) {
     return null;
@@ -661,12 +707,12 @@ const DocumentResultsViewer: React.FC<Props> = ({
             const containerHeight = getPanelHeight(doc.filename);
             const displayName = `${doc.filename} (${doc.fileHash.substring(0, 8)}...)`;
             const hasApiResponse = doc.apiResponses && doc.apiResponses.length > 0;
-            
+
             // Use iteration-specific scores for average calculation
-            const currentIterationScores = doc.iteration_scores && doc.iteration_scores[selectedIteration] 
-              ? doc.iteration_scores[selectedIteration] 
+            const currentIterationScores = doc.iteration_scores && doc.iteration_scores[selectedIteration]
+              ? doc.iteration_scores[selectedIteration]
               : doc.scores;
-            
+
             const averageScore = currentIterationScores && Object.keys(currentIterationScores).length > 0
               ? Object.values(currentIterationScores).reduce((a: number, b: number) => a + b, 0) / Object.values(currentIterationScores).length
               : 0;
@@ -691,11 +737,19 @@ const DocumentResultsViewer: React.FC<Props> = ({
             );
 
             // Use iteration-specific mismatches if available, otherwise fall back to general mismatches
-            const currentIterationMismatches = doc.iteration_mismatches && doc.iteration_mismatches[selectedIteration] 
-              ? doc.iteration_mismatches[selectedIteration] 
+            const currentIterationMismatches = doc.iteration_mismatches && doc.iteration_mismatches[selectedIteration]
+              ? doc.iteration_mismatches[selectedIteration]
               : doc.mismatches;
-            
-            const mismatchMap = buildMismatchMap(currentIterationMismatches);
+
+            const mismatchInfo = buildMismatchInfo(currentIterationMismatches);
+
+            // DEBUG: Log the mismatches and built info
+            if (currentIterationMismatches.length > 0) {
+              // eslint-disable-next-line no-console
+              console.log('🔍 Processing mismatches for', doc.filename, ':', currentIterationMismatches);
+              // eslint-disable-next-line no-console
+              console.log('📊 Built MismatchInfo:', JSON.stringify(mismatchInfo, null, 2));
+            }
 
             return (
               <div
@@ -791,14 +845,14 @@ const DocumentResultsViewer: React.FC<Props> = ({
                               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                                 {doc.groundTruth && !isEditing[doc.filename] && (
                                   <>
-                                    <button 
-                                      onClick={() => handleCopyGroundTruth(doc)} 
-                                      style={{ 
-                                        padding: '0.4rem', 
-                                        background: 'transparent', 
-                                        color: isDarkMode ? '#d1d5db' : '#6b7280', 
-                                        border: 'none', 
-                                        borderRadius: 4, 
+                                    <button
+                                      onClick={() => handleCopyGroundTruth(doc)}
+                                      style={{
+                                        padding: '0.4rem',
+                                        background: 'transparent',
+                                        color: isDarkMode ? '#d1d5db' : '#6b7280',
+                                        border: 'none',
+                                        borderRadius: 4,
                                         cursor: 'pointer',
                                         fontSize: '1.2rem',
                                         display: 'flex',
@@ -814,15 +868,15 @@ const DocumentResultsViewer: React.FC<Props> = ({
                                     >
                                       ⧉
                                     </button>
-                                    <button 
-                                      onClick={() => handleEditClick(doc.filename, doc.groundTruth)} 
-                                      style={{ 
-                                        padding: '0.3rem 1rem', 
-                                        background: '#ffe066', 
-                                        color: '#222', 
-                                        border: 'none', 
-                                        borderRadius: 4, 
-                                        fontWeight: 600 
+                                    <button
+                                      onClick={() => handleEditClick(doc.filename, doc.groundTruth)}
+                                      style={{
+                                        padding: '0.3rem 1rem',
+                                        background: '#ffe066',
+                                        color: '#222',
+                                        border: 'none',
+                                        borderRadius: 4,
+                                        fontWeight: 600
                                       }}
                                     >
                                       Edit
@@ -845,30 +899,35 @@ const DocumentResultsViewer: React.FC<Props> = ({
                                 </div>
                               </div>
                             ) : doc.groundTruth ? (
-                                                          <div
-                              ref={(el) => { groundTruthRefs.current[doc.filename] = el; }}
-                              onScroll={handleGroundTruthScroll(doc.filename)}
-                              style={{
-                                backgroundColor: isDarkMode ? '#374151' : '#f8f9fa',
-                                padding: '0.25rem',
-                                borderRadius: '4px',
-                                border: `1px solid ${isDarkMode ? '#4b5563' : '#e9ecef'}`,
-                                overflow: 'auto',
-                                flex: 1,
-                                minHeight: 0,
-                                height: '100%',
-                                scrollbarWidth: 'thin',
-                                scrollbarColor: isDarkMode ? '#6b7280 #374151' : '#cbd5e1 #f8f9fa'
-                              }}
-                              className="custom-scrollbar">
+                              <div
+                                ref={(el) => { groundTruthRefs.current[doc.filename] = el; }}
+                                onScroll={handleGroundTruthScroll(doc.filename)}
+                                style={{
+                                  backgroundColor: isDarkMode ? '#374151' : '#f8f9fa',
+                                  padding: '0.25rem',
+                                  borderRadius: '4px',
+                                  border: `1px solid ${isDarkMode ? '#4b5563' : '#e9ecef'}`,
+                                  overflow: 'auto',
+                                  flex: 1,
+                                  minHeight: 0,
+                                  height: '100%',
+                                  scrollbarWidth: 'thin',
+                                  scrollbarColor: isDarkMode ? '#6b7280 #374151' : '#cbd5e1 #f8f9fa'
+                                }}
+                                className="custom-scrollbar">
                                 {(() => {
-                          // Use iteration-specific scores if available, otherwise fall back to general scores
-                          const currentIterationScores = doc.iteration_scores && doc.iteration_scores[selectedIteration] 
-                            ? doc.iteration_scores[selectedIteration] 
-                            : doc.scores;
-                          
-                          return renderJsonScore(filteredGroundTruth, currentIterationScores, mismatchMap, getExtractedData(doc.apiResponses[selectedIteration] || doc.apiResponses[0] || {}));
-                        })()}
+                                  // Use iteration-specific scores if available, otherwise fall back to general scores
+                                  const currentIterationScores = doc.iteration_scores && doc.iteration_scores[selectedIteration]
+                                    ? doc.iteration_scores[selectedIteration]
+                                    : doc.scores;
+
+                                  return renderJsonScore(
+                                    filteredGroundTruth,
+                                    currentIterationScores,
+                                    mismatchInfo,
+                                    getExtractedData(doc.apiResponses[selectedIteration] || doc.apiResponses[0] || {})
+                                  );
+                                })()}
                               </div>
                             ) : (
                               <div style={{ textAlign: 'center', padding: '2rem', color: isDarkMode ? '#9ca3af' : '#6c757d', fontStyle: 'italic', backgroundColor: isDarkMode ? '#1f2937' : '#f8f9fa', border: `2px dashed ${isDarkMode ? '#4b5563' : '#dee2e6'}`, borderRadius: '4px' }}>
@@ -912,7 +971,7 @@ const DocumentResultsViewer: React.FC<Props> = ({
                               const handleMouseMove = (moveEvent: MouseEvent) => {
                                 // Only update if we're actually dragging
                                 if (!isDragging) return;
-                                
+
                                 const newX = moveEvent.clientX - containerRect.left;
                                 // Determine which panels we're resizing between
                                 const isGtAndApi = toggles.api;
@@ -974,14 +1033,14 @@ const DocumentResultsViewer: React.FC<Props> = ({
                               <h4 style={{ margin: 0, color: isDarkMode ? '#ffffff' : '#495057', fontSize: '1.1rem' }}>API Response</h4>
                               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                                 {hasApiResponse && (
-                                  <button 
-                                    onClick={() => handleCopyApiResponse(doc)} 
-                                    style={{ 
-                                      padding: '0.4rem', 
-                                      background: 'transparent', 
-                                      color: isDarkMode ? '#d1d5db' : '#6b7280', 
-                                      border: 'none', 
-                                      borderRadius: 4, 
+                                  <button
+                                    onClick={() => handleCopyApiResponse(doc)}
+                                    style={{
+                                      padding: '0.4rem',
+                                      background: 'transparent',
+                                      color: isDarkMode ? '#d1d5db' : '#6b7280',
+                                      border: 'none',
+                                      borderRadius: 4,
                                       cursor: 'pointer',
                                       fontSize: '1.2rem',
                                       display: 'flex',
@@ -1064,14 +1123,14 @@ const DocumentResultsViewer: React.FC<Props> = ({
                               {hasApiResponse ? (
                                 (() => {
                                   // Use iteration-specific scores if available, otherwise fall back to general scores
-                                  const currentIterationScores = doc.iteration_scores && doc.iteration_scores[selectedIteration] 
-                                    ? doc.iteration_scores[selectedIteration] 
+                                  const currentIterationScores = doc.iteration_scores && doc.iteration_scores[selectedIteration]
+                                    ? doc.iteration_scores[selectedIteration]
                                     : doc.scores;
-                                  
+
                                   return renderJsonScore(
                                     getExtractedData(doc.apiResponses[selectedIteration] || doc.apiResponses[0]),
                                     currentIterationScores,
-                                    mismatchMap,
+                                    mismatchInfo,
                                     filteredGroundTruth,
                                     '',
                                     false  // Don't show missing keys in API response
@@ -1115,7 +1174,7 @@ const DocumentResultsViewer: React.FC<Props> = ({
                               const handleMouseMove = (moveEvent: MouseEvent) => {
                                 // Only update if we're actually dragging
                                 if (!isDragging) return;
-                                
+
                                 const newX = moveEvent.clientX - containerRect.left;
                                 handleResize(doc.filename, newX, containerRect.width, 'api-pdf');
                               };
@@ -1288,7 +1347,7 @@ const DocumentResultsViewer: React.FC<Props> = ({
                           const handleMouseMove = (moveEvent: MouseEvent) => {
                             // Only update if we're actually dragging
                             if (!isDragging) return;
-                            
+
                             const deltaY = moveEvent.clientY - startY;
                             const newHeight = startHeight + deltaY;
                             handleVerticalResize(doc.filename, newHeight);
@@ -1344,7 +1403,7 @@ const DocumentResultsViewer: React.FC<Props> = ({
                           }}>
                           </div>
                         </div>
-                        
+
                         {/* Resizable issues container */}
                         <div style={{
                           padding: '0',
@@ -1357,49 +1416,49 @@ const DocumentResultsViewer: React.FC<Props> = ({
                             scrollbarColor: isDarkMode ? '#6b7280 #1f2937' : '#cbd5e1 #f8f9fa',
                             backgroundColor: isDarkMode ? '#111827' : '#ffffff'
                           }}>
-                          {currentIterationMismatches.map((mismatch, index) => {
-                            // Detect issue type based on mismatch content
-                            const fpMatch = mismatch.match(/\[FP\]/i);
-                            const fnMatch = mismatch.match(/\[FN\]/i);
-                            const partialMatch = mismatch.match(/\[PARTIAL\]/i);
+                            {currentIterationMismatches.map((mismatch, index) => {
+                              // Detect issue type based on mismatch content
+                              const fpMatch = mismatch.match(/\[FP\]/i);
+                              const fnMatch = mismatch.match(/\[FN\]/i);
+                              const partialMatch = mismatch.match(/\[PARTIAL\]/i);
 
-                            let issueType = 'Other';
-                            let bgColor = isDarkMode ? '#374151' : '#f8f9fa';
-                            let textColor = isDarkMode ? '#ffffff' : '#000000';
-                            let borderColor = '#e5e7eb';
-                            let icon = '⚠️';
+                              let issueType = 'Other';
+                              let bgColor = isDarkMode ? '#374151' : '#f8f9fa';
+                              let textColor = isDarkMode ? '#ffffff' : '#000000';
+                              let borderColor = '#e5e7eb';
+                              let icon = '⚠️';
 
-                            if (fpMatch || partialMatch) {
-                              issueType = 'False Positive';
-                              bgColor = isDarkMode ? '#7f1d1d' : '#fef2f2';
-                              textColor = isDarkMode ? '#fecaca' : '#991b1b';
-                              borderColor = '#dc2626';
-                              icon = '❌';
-                            } else if (fnMatch) {
-                              issueType = 'False Negative';
-                              bgColor = isDarkMode ? '#78350f' : '#fffbeb';
-                              textColor = isDarkMode ? '#fcd34d' : '#92400e';
-                              borderColor = '#f59e0b';
-                              icon = '❗';
-                            }
+                              if (fpMatch || partialMatch) {
+                                issueType = 'False Positive';
+                                bgColor = isDarkMode ? '#7f1d1d' : '#fef2f2';
+                                textColor = isDarkMode ? '#fecaca' : '#991b1b';
+                                borderColor = '#dc2626';
+                                icon = '❌';
+                              } else if (fnMatch) {
+                                issueType = 'False Negative';
+                                bgColor = isDarkMode ? '#78350f' : '#fffbeb';
+                                textColor = isDarkMode ? '#fcd34d' : '#92400e';
+                                borderColor = '#f59e0b';
+                                icon = '❗';
+                              }
 
-                            return (
-                              <div key={index} style={{
-                                padding: '0.25rem 0.5rem',
-                                borderBottom: index < currentIterationMismatches.length - 1 ? `1px solid ${isDarkMode ? '#374151' : '#f1f5f9'}` : 'none',
-                                fontSize: '0.75rem',
-                                backgroundColor: bgColor,
-                                color: textColor,
-                                borderLeft: `3px solid ${borderColor}`,
-                                marginBottom: '0',
-                                fontFamily: 'monospace'
-                              }}>
-                                {mismatch}
-                              </div>
-                            );
-                          })}
+                              return (
+                                <div key={index} style={{
+                                  padding: '0.25rem 0.5rem',
+                                  borderBottom: index < currentIterationMismatches.length - 1 ? `1px solid ${isDarkMode ? '#374151' : '#f1f5f9'}` : 'none',
+                                  fontSize: '0.75rem',
+                                  backgroundColor: bgColor,
+                                  color: textColor,
+                                  borderLeft: `3px solid ${borderColor}`,
+                                  marginBottom: '0',
+                                  fontFamily: 'monospace'
+                                }}>
+                                  {mismatch}
+                                </div>
+                              );
+                            })}
                           </div>
-                          
+
                           {/* Drag handle for resizing issues */}
                           <div style={{
                             height: '6px',
@@ -1409,40 +1468,40 @@ const DocumentResultsViewer: React.FC<Props> = ({
                             marginTop: '4px',
                             borderRadius: '0 0 4px 4px'
                           }}
-                          onMouseDown={(e) => {
-                            e.preventDefault();
-                            const startY = e.clientY;
-                            const startHeight = getIssuesHeight(doc.filename);
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              const startY = e.clientY;
+                              const startHeight = getIssuesHeight(doc.filename);
 
-                            let isDragging = false;
+                              let isDragging = false;
 
-                            const handleMouseMove = (moveEvent: MouseEvent) => {
-                              if (!isDragging) return;
-                              
-                              const deltaY = moveEvent.clientY - startY;
-                              const newHeight = startHeight + deltaY;
-                              handleIssuesResize(doc.filename, newHeight);
-                            };
+                              const handleMouseMove = (moveEvent: MouseEvent) => {
+                                if (!isDragging) return;
 
-                            const cleanup = () => {
-                              isDragging = false;
-                              document.removeEventListener('mousemove', handleMouseMove);
-                              document.removeEventListener('mouseup', handleMouseUp);
-                              document.removeEventListener('mouseleave', handleMouseUp);
-                              window.removeEventListener('blur', handleMouseUp);
-                            };
+                                const deltaY = moveEvent.clientY - startY;
+                                const newHeight = startHeight + deltaY;
+                                handleIssuesResize(doc.filename, newHeight);
+                              };
 
-                            const handleMouseUp = () => {
-                              cleanup();
-                            };
+                              const cleanup = () => {
+                                isDragging = false;
+                                document.removeEventListener('mousemove', handleMouseMove);
+                                document.removeEventListener('mouseup', handleMouseUp);
+                                document.removeEventListener('mouseleave', handleMouseUp);
+                                window.removeEventListener('blur', handleMouseUp);
+                              };
 
-                            isDragging = true;
+                              const handleMouseUp = () => {
+                                cleanup();
+                              };
 
-                            document.addEventListener('mousemove', handleMouseMove);
-                            document.addEventListener('mouseup', handleMouseUp);
-                            document.addEventListener('mouseleave', handleMouseUp);
-                            window.addEventListener('blur', handleMouseUp);
-                          }}
+                              isDragging = true;
+
+                              document.addEventListener('mousemove', handleMouseMove);
+                              document.addEventListener('mouseup', handleMouseUp);
+                              document.addEventListener('mouseleave', handleMouseUp);
+                              window.addEventListener('blur', handleMouseUp);
+                            }}
                           />
                         </div>
                       </div>

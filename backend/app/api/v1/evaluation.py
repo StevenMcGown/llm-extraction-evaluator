@@ -138,6 +138,7 @@ class EvaluationRequest(BaseModel):
     )
     excluded_fields: Optional[List[str]] = Field(None, description="JSON pointer paths to exclude from evaluation (e.g., ['/medications/medications/frequency'])")
     selected_files: Optional[List[str]] = Field(None, description="List of specific files to process (if not provided, processes all files)")
+    evaluation_run_id: Optional[str] = Field(None, description="Evaluation run ID (generated automatically if not provided)")
 
 class SeedGroundTruthRequest(BaseModel):
     source_data_uri: str = Field(..., description="S3 URI to source PDF files")
@@ -921,11 +922,8 @@ async def run_evaluation_task(evaluation_id: str, request: EvaluationRequest):
             result.status = "running"
             logger.info(f"Starting evaluation {evaluation_id} - acquired lock")
             
-            # Generate evaluation run ID if not provided
-            if not hasattr(request, 'evaluation_run_id') or not request.evaluation_run_id:
-                evaluation_run_id = generate_evaluation_run_id()
-            else:
-                evaluation_run_id = request.evaluation_run_id
+            # Use the evaluation_run_id that was set in the request
+            evaluation_run_id = request.evaluation_run_id
             
             # Save evaluation metadata to S3 if responses_uri is provided
             if request.responses_uri:
@@ -1190,19 +1188,19 @@ async def run_evaluation_task(evaluation_id: str, request: EvaluationRequest):
 async def run_evaluation(request: EvaluationRequest, background_tasks: BackgroundTasks):
     """Start a new evaluation run with the specified parameters."""
     
-    # Generate evaluation ID
-    evaluation_id = hashlib.md5(f"{request.source_data_uri}{request.ground_truth_uri}{request.iterations}".encode()).hexdigest()
+    # Generate evaluation run ID upfront (this will be used consistently)
+    evaluation_run_id = generate_evaluation_run_id()
     
     # Check if evaluation lock is currently held
     lock_acquired = evaluation_lock.locked()
     if lock_acquired:
-        logger.info(f"Evaluation {evaluation_id} queued - another evaluation is currently running")
+        logger.info(f"Evaluation {evaluation_run_id} queued - another evaluation is currently running")
     else:
-        logger.info(f"Evaluation {evaluation_id} starting - no queue")
+        logger.info(f"Evaluation {evaluation_run_id} starting - no queue")
     
-    # Initialize evaluation result
-    evaluation_store[evaluation_id] = EvaluationResult(
-        evaluation_id=evaluation_id,
+    # Initialize evaluation result using evaluation_run_id as key
+    evaluation_store[evaluation_run_id] = EvaluationResult(
+        evaluation_id=evaluation_run_id,
         status="queued" if lock_acquired else "running",
         documents=[],
         metrics=EvaluationMetrics(
@@ -1216,11 +1214,14 @@ async def run_evaluation(request: EvaluationRequest, background_tasks: Backgroun
         errors=[]
     )
     
+    # Add evaluation_run_id to the request so background task can use it
+    request.evaluation_run_id = evaluation_run_id
+    
     # Start background evaluation task
-    background_tasks.add_task(run_evaluation_task, evaluation_id, request)
+    background_tasks.add_task(run_evaluation_task, evaluation_run_id, request)
     
     return {
-        "evaluation_id": evaluation_id, 
+        "evaluation_id": evaluation_run_id, 
         "status": "queued" if lock_acquired else "started",
         "message": "Evaluation queued - another evaluation is running" if lock_acquired else "Evaluation started"
     }
