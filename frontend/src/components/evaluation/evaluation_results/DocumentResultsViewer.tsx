@@ -1,4 +1,8 @@
 import React, { useState, useRef } from 'react';
+import { buildMismatchInfo, HighlightType, MismatchInfo } from './utils/mismatch';
+import { getValueAtPath, resolveScore, getScoreColor } from './utils/jsonUtils';
+import { getPdfUrl } from './utils/fileUtils';
+import { getExtractedData, filterGroundTruthByTypes, isFieldExcluded, copyToClipboard } from './utils/documentUtils';
 
 interface DocumentResult {
   filename: string;
@@ -89,54 +93,6 @@ const DocumentResultsViewer: React.FC<Props> = ({
 
   const getPanelHeight = (filename: string) => panelHeights[filename] || 600;
   const getIssuesHeight = (filename: string) => issuesHeights[filename] || 300;
-
-  // Check if a field path is excluded
-  const isFieldExcluded = (fieldPath: string): boolean => {
-    if (!excludedFields || excludedFields.length === 0) return false;
-
-    // Convert dot notation path to JSON pointer format for comparison
-    const jsonPointer = '/' + fieldPath.replace(/\./g, '/').replace(/\[(\d+)\]/g, '/$1');
-
-    const isExcluded = excludedFields.some(excludedPath => {
-      // Exact match
-      if (jsonPointer === excludedPath) {
-        return true;
-      }
-
-      // Child of excluded path
-      if (jsonPointer.startsWith(excludedPath + '/')) {
-        return true;
-      }
-
-      // Wildcard pattern matching:
-      // `/medications/medications/frequency` should match `/medications/medications/0/frequency`
-      // Strategy: Remove array indices from both paths and compare
-      const normalizeForWildcard = (path: string) => path.replace(/\/\d+/g, '');
-
-      const normalizedField = normalizeForWildcard(jsonPointer);
-      const normalizedExcluded = normalizeForWildcard(excludedPath);
-
-      if (normalizedField === normalizedExcluded) {
-        return true;
-      }
-
-      // Also check if the excluded path is a pattern that matches this specific field
-      // e.g., excluded=/medications/medications/frequency should match field=/medications/medications/0/frequency
-      if (!excludedPath.includes('/0/') && !excludedPath.includes('/1/') && !excludedPath.includes('/2/')) {
-        // This looks like a wildcard pattern, try to match it against the specific field
-        const regex = new RegExp('^' + excludedPath.replace(/\//g, '\\/') + '$');
-        const fieldWithWildcard = jsonPointer.replace(/\/\d+/g, '');
-
-        if (regex.test(fieldWithWildcard)) {
-          return true;
-        }
-      }
-
-      return false;
-    });
-
-    return isExcluded;
-  };
 
   const setPanelToggle = (filename: string, panel: 'gt' | 'api' | 'pdf', value: boolean) => {
     setPanelToggles(prev => ({
@@ -385,23 +341,6 @@ const DocumentResultsViewer: React.FC<Props> = ({
     setIsEditing(prev => ({ ...prev, [filename]: true }));
   };
 
-  const copyToClipboard = async (text: string, type: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      // You could add a toast notification here if desired
-      console.log(`${type} copied to clipboard`);
-    } catch (err) {
-      console.error('Failed to copy to clipboard:', err);
-      // Fallback for older browsers
-      const textArea = document.createElement('textarea');
-      textArea.value = text;
-      document.body.appendChild(textArea);
-      textArea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textArea);
-    }
-  };
-
   const handleCopyGroundTruth = (doc: DocumentResult) => {
     if (doc.groundTruth) {
       const jsonString = JSON.stringify(doc.groundTruth, null, 2);
@@ -417,145 +356,6 @@ const DocumentResultsViewer: React.FC<Props> = ({
     }
   };
 
-  // Utility functions
-  const getScoreColor = (score: number): string => {
-    if (score === 1.0) return '#28a745';
-    if (score >= 0.7) return '#fd7e14';
-    if (score >= 0.5) return '#ffc107';
-    return '#dc3545';
-  };
-
-  // --- new types for clarity ---
-  type HighlightType = 'FP' | 'FN';
-
-  interface ValueBasedHighlight {
-    type: HighlightType;
-    basePathRe: RegExp; // pattern to match paths irrespective of numeric indices
-    bracketValue: string;
-  }
-
-  interface MismatchInfo {
-    pathMap: Record<string, HighlightType>; // exact / normalised path matches
-    valueBased: ValueBasedHighlight[];      // med_name-style bracketed value matches
-  }
-
-  // Replacement for buildMismatchMap – now value-aware
-  const buildMismatchInfo = (mismatches: string[]): MismatchInfo => {
-    const pathMap: Record<string, HighlightType> = {};
-    const valueBased: ValueBasedHighlight[] = [];
-
-    const escapeForRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-    mismatches.forEach(m => {
-      const typeMatch = m.match(/\]\s+\[(FP|FN)\]\s+/i);
-      const pathMatch = m.match(/\]\s+\[(FP|FN)\]\s+([^:]+):/); // path after the FP/FN tag
-      if (!typeMatch || !pathMatch) return;
-
-      const type = typeMatch[1].toUpperCase() as HighlightType;
-      const rawPath = pathMatch[2].trim(); // e.g., "medications.medications[||].med_name[cefpodoxime]"
-
-      // Does it have a bracketed value at the end?
-      const bracketMatch = rawPath.match(/([^\.\[\]]+)\[([^\]]+)\]$/);
-      if (bracketMatch) {
-        // Value-specific mismatch: do NOT put into pathMap
-        const bracketValue = bracketMatch[2]; // e.g., "cefpodoxime"
-        // Base path without trailing bracketed value
-        const baseField = rawPath.replace(/\[([^\]]+)\]$/, '');
-
-        // Use sentinel approach for predictable escaping
-        const sentinel = '__ARRAY_IDX__';
-        const withSentinel = baseField.replace('[||]', sentinel);
-        let regexStr = '^' + escapeForRegex(withSentinel).replace(sentinel, '\\[\\d+\\]') + '$';
-
-        try {
-          const basePathRe = new RegExp(regexStr);
-          // eslint-disable-next-line no-console
-          console.log('ValueBased entry:', { type, regexStr, bracketValue });
-          valueBased.push({ type, basePathRe, bracketValue });
-        } catch (err) {
-          // eslint-disable-next-line no-console
-          console.warn('Failed to compile value-based regex', regexStr, err);
-        }
-      } else {
-        // Generic path-level mismatch → populate pathMap (normalized)
-        // 1) Strip ALL bracketed segments so both numeric and token variants normalize
-        const strippedAllBrackets = rawPath.replace(/\[[^\]]+\]/g, '');
-        if (!pathMap[strippedAllBrackets]) {
-          pathMap[strippedAllBrackets] = type;
-          // eslint-disable-next-line no-console
-          console.log('Adding to pathMap', { key: strippedAllBrackets, type });
-        }
-
-        // 2) Variant that preserves numeric indices but removes non-numeric brackets (optional safety net)
-        const withoutNonNumeric = rawPath.replace(/\[[^\d\]]+\]/g, '');
-        if (!pathMap[withoutNonNumeric]) {
-          pathMap[withoutNonNumeric] = type;
-          // eslint-disable-next-line no-console
-          console.log('Adding to pathMap', { key: withoutNonNumeric, type });
-        }
-      }
-    });
-
-    return { pathMap, valueBased };
-  };
-
-  // Resolve score for a JSON path, falling back to a version with array indices stripped
-  const resolveScore = (path: string, scores: Record<string, number>): number | undefined => {
-    if (scores[path] !== undefined) return scores[path];
-    const noIndices = path.replace(/\[\d+\]/g, '');
-    return scores[noIndices];
-  };
-
-  // Helper function to get value at a specific path in an object
-  const getValueAtPath = (obj: any, path: string): any => {
-    if (!obj || !path) return undefined;
-
-    const parts = path.split('.');
-    let current = obj;
-
-    for (const part of parts) {
-      if (part.includes('[') && part.includes(']')) {
-        // Handle array indices like "codes[0]"
-        const [key, indexStr] = part.split('[');
-        const index = parseInt(indexStr.replace(']', ''));
-        current = current?.[key]?.[index];
-      } else {
-        current = current?.[part];
-      }
-      if (current === undefined) return undefined;
-    }
-
-    return current;
-  };
-
-  // Simple function to get PDF URL
-  const getPdfUrl = (hash: string, originalName: string) => {
-    const ext = originalName.split('.').pop() || 'pdf';
-    const key = hash.endsWith(`.${ext}`) ? hash : `${hash}.${ext}`;
-    const fullPath = `${settings.sourceDataPath.replace(/\/$/, '')}/${encodeURIComponent(key)}`;
-
-    if (fullPath.startsWith('s3://')) {
-      return `http://localhost:8000/proxy-pdf?uri=${encodeURIComponent(fullPath)}`;
-    }
-
-    return fullPath;
-  };
-
-  // Helper to get extracted_data from API response
-  const getExtractedData = (apiResponse: any) => apiResponse && apiResponse.extracted_data ? apiResponse.extracted_data : {};
-
-  // Helper to filter ground truth by extraction types
-  const filterGroundTruthByTypes = (groundTruth: any, extractionTypes: string[]) => {
-    if (!groundTruth || !extractionTypes) return {};
-    const filtered: any = {};
-    for (const key of extractionTypes) {
-      if (groundTruth.hasOwnProperty(key)) {
-        filtered[key] = groundTruth[key];
-      }
-    }
-    return filtered;
-  };
-
   // Enhanced renderer: highlights both by exact path and by value matches within bracketed mismatch descriptions
   const renderJsonScore = (
     data: any,
@@ -563,8 +363,12 @@ const DocumentResultsViewer: React.FC<Props> = ({
     mismatchInfo: MismatchInfo = { pathMap: {}, valueBased: [] },
     groundTruthData: any = {},
     path: string = '',
-    showMissingKeys: boolean = true
+    showMissingKeys: boolean = true,
+    rootData?: any  // Add rootData parameter
   ) => {
+    // Set rootData to current data on first call
+    const currentRootData = rootData || data;
+    
     if (typeof data !== 'object' || data === null) {
       return <span>{JSON.stringify(data)}</span>;
     }
@@ -575,7 +379,7 @@ const DocumentResultsViewer: React.FC<Props> = ({
           [
           {data.map((v, i) => (
             <div key={i} style={{ paddingLeft: 16 }}>
-              {renderJsonScore(v, scores, mismatchInfo, groundTruthData, `${path}[${i}]`, showMissingKeys)}
+              {renderJsonScore(v, scores, mismatchInfo, groundTruthData, `${path}[${i}]`, showMissingKeys, currentRootData)}
               {i < data.length - 1 && ','}
             </div>
           ))}
@@ -611,9 +415,44 @@ const DocumentResultsViewer: React.FC<Props> = ({
             if (v != null && typeof v !== 'object') {
               const valStr = String(v).toLowerCase();
               for (const entry of mismatchInfo.valueBased) {
-                if (entry.basePathRe.test(full) && valStr === entry.bracketValue.toLowerCase()) {
-                  highlight = entry.type;
-                  break;
+                if (entry.basePathRe.test(full)) {
+                  // Check if this is compound format (dosage|value)
+                  if (entry.bracketValue.includes('|')) {
+                    const [dosage, expectedValue] = entry.bracketValue.split('|');
+                    
+                    // For compound format, check both dosage and value match
+                    if (full.match(/medications\.medications\[\d+\]\./)) {
+                      const indexMatch = full.match(/medications\.medications\[(\d+)\]\./);
+                      if (indexMatch) {
+                        const index = parseInt(indexMatch[1]);
+                        const medication = currentRootData?.medications?.medications?.[index];
+                        if (medication && medication.dosage === dosage && valStr === expectedValue.toLowerCase()) {
+                          highlight = entry.type;
+                          console.log('✅ compound match', { full, value: v, dosage: medication.dosage, expectedDosage: dosage, expectedValue });
+                          break;
+                        }
+                      }
+                    }
+                  } else {
+                    // For pipe-bracket format, check if this field belongs to a medication with the expected dosage
+                    if (full.match(/medications\.medications\[\d+\]\./)) {
+                      const indexMatch = full.match(/medications\.medications\[(\d+)\]\./);
+                      if (indexMatch) {
+                        const index = parseInt(indexMatch[1]);
+                        const medication = currentRootData?.medications?.medications?.[index];
+                        if (medication && medication.dosage === entry.bracketValue) {
+                          highlight = entry.type;
+                          console.log('✅ dosage-based match', { full, value: v, dosage: medication.dosage, expectedDosage: entry.bracketValue });
+                          break;
+                        }
+                      }
+                    } else if (valStr === entry.bracketValue.toLowerCase()) {
+                      // Original exact value matching
+                      highlight = entry.type;
+                      console.log('✅ value-based match', { full, value: v, entry: entry.basePathRe.toString(), bracketValue: entry.bracketValue });
+                      break;
+                    }
+                  }
                 }
               }
             }
@@ -635,7 +474,7 @@ const DocumentResultsViewer: React.FC<Props> = ({
 
             const gtValue = getValueAtPath(groundTruthData, full);
             const valuesAreIdentical = JSON.stringify(v) === JSON.stringify(gtValue);
-            const fieldIsExcluded = isFieldExcluded(full);
+            const fieldIsExcluded = isFieldExcluded(full, excludedFields);
 
             // Key styling
             let keyStyle: React.CSSProperties | undefined;
@@ -669,7 +508,7 @@ const DocumentResultsViewer: React.FC<Props> = ({
             return (
               <div key={`${full}-${idx}`} style={{ paddingLeft: 16 }}>
                 <span style={keyStyle}>{JSON.stringify(k)}</span>: {typeof v === 'object' ? (
-                  renderJsonScore(v, scores, mismatchInfo, groundTruthData, full, showMissingKeys)
+                  renderJsonScore(v, scores, mismatchInfo, groundTruthData, full, showMissingKeys, currentRootData)
                 ) : (
                   <span style={valueStyle}>{JSON.stringify(v)}</span>
                 )}{idx < allKeys.length - 1 && ','}
@@ -925,7 +764,10 @@ const DocumentResultsViewer: React.FC<Props> = ({
                                     filteredGroundTruth,
                                     currentIterationScores,
                                     mismatchInfo,
-                                    getExtractedData(doc.apiResponses[selectedIteration] || doc.apiResponses[0] || {})
+                                    getExtractedData(doc.apiResponses[selectedIteration] || doc.apiResponses[0] || {}),
+                                    '',
+                                    true,
+                                    filteredGroundTruth
                                   );
                                 })()}
                               </div>
@@ -1133,7 +975,8 @@ const DocumentResultsViewer: React.FC<Props> = ({
                                     mismatchInfo,
                                     filteredGroundTruth,
                                     '',
-                                    false  // Don't show missing keys in API response
+                                    false,  // Don't show missing keys in API response
+                                    getExtractedData(doc.apiResponses[selectedIteration] || doc.apiResponses[0])
                                   );
                                 })()
                               ) : (
@@ -1231,7 +1074,7 @@ const DocumentResultsViewer: React.FC<Props> = ({
                                 height: '100%',
                               }}>
                                 <iframe
-                                  src={getPdfUrl(doc.fileHash, doc.filename)}
+                                  src={getPdfUrl(doc.fileHash, doc.filename, settings.sourceDataPath)}
                                   title={`PDF: ${doc.filename}`}
                                   style={{
                                     width: '100%',
