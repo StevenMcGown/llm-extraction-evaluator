@@ -1,10 +1,34 @@
 import React, { useState } from 'react';
-import HealthStatus from './components/HealthStatus';
+import HealthStatus from './components/common/HealthStatus';
 import { SettingsProvider } from './context/SettingsContext';
 import EvaluationDashboard from './components/evaluation/EvaluationDashboard';
+import Dashboard from './components/dashboard/Dashboard';
+
+type TabType = 'dashboard' | 'evaluation';
 
 function App() {
   const [isDarkMode, setIsDarkMode] = useState<boolean>(false);
+  const [activeTab, setActiveTab] = useState<TabType>('dashboard');
+
+  const tabStyle = (isActive: boolean) => ({
+    padding: '0.75rem 1.5rem',
+    background: isActive 
+      ? (isDarkMode ? '#374151' : '#ffffff') 
+      : 'transparent',
+    color: isActive 
+      ? (isDarkMode ? '#ffffff' : '#111827')
+      : (isDarkMode ? '#9ca3af' : '#6b7280'),
+    border: 'none',
+    borderBottom: isActive 
+      ? `3px solid ${isDarkMode ? '#3b82f6' : '#2563eb'}` 
+      : '3px solid transparent',
+    cursor: 'pointer',
+    fontSize: '0.875rem',
+    fontWeight: '600',
+    transition: 'all 0.2s ease',
+    borderRadius: '8px 8px 0 0',
+    marginRight: '0.25rem'
+  });
 
   return (
     <SettingsProvider>
@@ -19,7 +43,7 @@ function App() {
         color: isDarkMode ? '#ffffff' : '#000000',
         transition: 'all 0.3s ease'
       }}>
-        {/* Simple header */}
+        {/* Header */}
         <div style={{ 
           display: 'flex', 
           gap: '2rem', 
@@ -65,16 +89,69 @@ function App() {
                 (e.target as HTMLElement).style.background = isDarkMode ? '#374151' : '#ffffff';
               }}
             >
-              <span style={{ fontSize: '1rem' }}>
-                {isDarkMode ? '☀️' : '🌙'}
-              </span>
+              <span style={{ 
+                width: '16px', 
+                height: '16px', 
+                display: 'inline-block',
+                backgroundColor: isDarkMode ? '#fbbf24' : '#1e40af',
+                borderRadius: isDarkMode ? '50%' : '2px',
+                transition: 'all 0.2s ease'
+              }} />
               {isDarkMode ? 'Light Mode' : 'Dark Mode'}
             </button>
           </div>
         </div>
 
+        {/* Tab Navigation */}
+        <div style={{
+          backgroundColor: isDarkMode ? '#1f2937' : '#ffffff',
+          borderBottom: `1px solid ${isDarkMode ? '#374151' : '#e5e7eb'}`,
+          padding: '0 2rem'
+        }}>
+          <div style={{ display: 'flex', gap: '0' }}>
+            <button
+              style={tabStyle(activeTab === 'dashboard')}
+              onClick={() => setActiveTab('dashboard')}
+              onMouseOver={(e) => {
+                if (activeTab !== 'dashboard') {
+                  (e.target as HTMLElement).style.backgroundColor = isDarkMode ? '#374151' : '#f9fafb';
+                }
+              }}
+              onMouseOut={(e) => {
+                if (activeTab !== 'dashboard') {
+                  (e.target as HTMLElement).style.backgroundColor = 'transparent';
+                }
+              }}
+            >
+              Dashboard
+            </button>
+            <button
+              style={tabStyle(activeTab === 'evaluation')}
+              onClick={() => setActiveTab('evaluation')}
+              onMouseOver={(e) => {
+                if (activeTab !== 'evaluation') {
+                  (e.target as HTMLElement).style.backgroundColor = isDarkMode ? '#374151' : '#f9fafb';
+                }
+              }}
+              onMouseOut={(e) => {
+                if (activeTab !== 'evaluation') {
+                  (e.target as HTMLElement).style.backgroundColor = 'transparent';
+                }
+              }}
+            >
+              Evaluation
+            </button>
+          </div>
+        </div>
+
+        {/* Tab Content */}
         <div style={{ padding: '2rem' }}>
-          <EvaluationDashboard isDarkMode={isDarkMode} setIsDarkMode={setIsDarkMode} />
+          {activeTab === 'dashboard' && (
+            <Dashboard isDarkMode={isDarkMode} />
+          )}
+          {activeTab === 'evaluation' && (
+            <EvaluationDashboard isDarkMode={isDarkMode} setIsDarkMode={setIsDarkMode} />
+          )}
         </div>
       </div>
     </SettingsProvider>

@@ -1,6 +1,6 @@
 import React from 'react';
 import SectionHeader from '../../common/SectionHeader';
-import FileUploader from '../../FileUploader';
+import FileUploader from './FileUploader';
 
 interface SourceFileSelectorProps {
   sourceFiles: string[];

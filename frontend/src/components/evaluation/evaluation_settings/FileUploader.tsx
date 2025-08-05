@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { uploadFile } from '../services/api';
-import { useSettings } from '../context/SettingsContext';
+import { uploadFile } from '../../../services/api';
+import { useSettings } from '../../../context/SettingsContext';
 
 const FileUploader: React.FC = () => {
   const [status, setStatus] = useState<string>('');
