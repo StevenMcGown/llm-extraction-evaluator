@@ -2,7 +2,7 @@ import React, { useState, useRef } from 'react';
 import { buildMismatchInfo, HighlightType, MismatchInfo } from './utils/mismatch';
 import { getValueAtPath, resolveScore, getScoreColor } from './utils/jsonUtils';
 import { getPdfUrl } from './utils/fileUtils';
-import { getExtractedData, filterGroundTruthByTypes, isFieldExcluded, copyToClipboard } from './utils/documentUtils';
+import { getExtractedData, filterGroundTruthByTypes, isFieldExcluded, copyToClipboard, calculateDocumentScore } from './utils/documentUtils';
 
 interface DocumentResult {
   filename: string;
@@ -484,7 +484,7 @@ const DocumentResultsViewer: React.FC<Props> = ({
               keyStyle = { backgroundColor: '#8b5cf620', padding: '0 4px', color: '#8b5cf6', fontWeight: 'bold' };
             } else if (highlight === 'FP') {
               keyStyle = { backgroundColor: 'rgba(255,179,179,0.25)', padding: '0 4px', color: '#ef4444', fontWeight: 'bold' };
-            } else if (score === undefined || score >= 0.99 || valuesAreIdentical) {
+            } else if (score === undefined || score === 1.0 || valuesAreIdentical) {
               keyStyle = { color: '#28a745', fontWeight: 'bold' };
             } else {
               keyStyle = { color: isDarkMode ? '#d1d5db' : '#374151', fontWeight: 'normal' };
@@ -498,7 +498,7 @@ const DocumentResultsViewer: React.FC<Props> = ({
               valueStyle = { backgroundColor: '#8b5cf620', padding: '0 4px', color: '#8b5cf6', fontWeight: 'bold' };
             } else if (highlight === 'FP') {
               valueStyle = { backgroundColor: 'rgba(255,179,179,0.25)', padding: '0 4px', color: '#ef4444', fontWeight: 'bold' };
-            } else if (score === undefined || score >= 0.99 || valuesAreIdentical) {
+            } else if (score === undefined || score === 1.0 || valuesAreIdentical) {
               valueStyle = { color: '#28a745', fontWeight: 'bold' };
             } else {
               const color = getScoreColor(score);
@@ -547,14 +547,13 @@ const DocumentResultsViewer: React.FC<Props> = ({
             const displayName = `${doc.filename} (${doc.fileHash.substring(0, 8)}...)`;
             const hasApiResponse = doc.apiResponses && doc.apiResponses.length > 0;
 
-            // Use iteration-specific scores for average calculation
+            // Calculate score as (non-null fields) / (non-null fields + total FN + FP across all iterations)
+            const averageScore = calculateDocumentScore(doc);
+
+            // Keep iteration-specific scores for highlighting
             const currentIterationScores = doc.iteration_scores && doc.iteration_scores[selectedIteration]
               ? doc.iteration_scores[selectedIteration]
               : doc.scores;
-
-            const averageScore = currentIterationScores && Object.keys(currentIterationScores).length > 0
-              ? Object.values(currentIterationScores).reduce((a: number, b: number) => a + b, 0) / Object.values(currentIterationScores).length
-              : 0;
 
             const extractionTypes = (doc.apiResponses[selectedIteration] || doc.apiResponses[0] || {}).extractionTypes || [];
             const filteredGroundTruth = filterGroundTruthByTypes(doc.groundTruth, extractionTypes);
@@ -628,12 +627,14 @@ const DocumentResultsViewer: React.FC<Props> = ({
                       {hasApiResponse && (
                         <span style={{
                           fontSize: '0.8rem',
-                          color: averageScore > 0.8 ? '#28a745' : averageScore > 0.5 ? '#fd7e14' : '#dc3545',
+                          color: averageScore === 1.0 ? '#28a745' : averageScore > 0.5 ? '#fd7e14' : '#dc3545',
                           marginLeft: '1rem',
-                          backgroundColor: averageScore > 0.8 ? '#d4edda' : averageScore > 0.5 ? '#fff3cd' : '#f8d7da',
+                          backgroundColor: averageScore === 1.0 ? '#d4edda' : averageScore > 0.5 ? '#fff3cd' : '#f8d7da',
                           padding: '0.25rem 0.5rem',
                           borderRadius: '12px',
-                          border: `1px solid ${averageScore > 0.8 ? '#c3e6cb' : averageScore > 0.5 ? '#ffeaa7' : '#f5c6cb'}`
+                          border: `1px solid ${averageScore === 1.0 ? '#c3e6cb' : averageScore > 0.5 ? '#ffeaa7' : '#f5c6cb'}`,
+                          // Darker text for dark mode
+                          filter: isDarkMode ? 'brightness(1.2) contrast(1.1)' : 'none'
                         }}>
                           ✓ Score: {(averageScore * 100).toFixed(0)}%
                         </span>

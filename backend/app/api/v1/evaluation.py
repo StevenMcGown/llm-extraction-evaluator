@@ -915,6 +915,10 @@ def calculate_overall_metrics(all_scores: List[Dict[str, float]], all_true_negat
 async def run_evaluation_task(evaluation_id: str, request: EvaluationRequest):
     """Background task to run the actual evaluation."""
     try:
+        # Add a startup delay to give frontend time to start polling
+        logger.info(f"Evaluation {evaluation_id}: Starting in 2 seconds to allow frontend setup...")
+        await asyncio.sleep(2.0)
+        
         # Wait for the evaluation lock to ensure only one evaluation runs at a time
         async with evaluation_lock:
             # Update status to running once we acquire the lock
@@ -1007,7 +1011,14 @@ async def run_evaluation_task(evaluation_id: str, request: EvaluationRequest):
             # Initialize result
             result = evaluation_store[evaluation_id]
             result.total_files = len(source_files)
-            result.total_iterations = len(source_files) * request.iterations
+            
+            # Only update total_iterations if it was an estimate (when no files were selected)
+            # If files were selected, the initial calculation should be accurate
+            if not request.selected_files:
+                result.total_iterations = len(source_files) * request.iterations
+                logger.info(f"Evaluation {evaluation_id}: Updated total_iterations from estimate to actual - {len(source_files)} files * {request.iterations} iterations = {result.total_iterations}")
+            else:
+                logger.info(f"Evaluation {evaluation_id}: Using pre-calculated total_iterations = {result.total_iterations} for {len(source_files)} selected files")
             
             document_evaluations = []
             all_scores = []
@@ -1019,7 +1030,7 @@ async def run_evaluation_task(evaluation_id: str, request: EvaluationRequest):
                     filename = file_info['filename']
                     file_hash = get_file_hash_from_key(source_key)
                     
-                    logger.info(f"Processing file: {filename} (hash: {file_hash})")
+                    logger.info(f"Evaluation {evaluation_id}: Starting file {result.completed_files + 1}/{len(source_files)}: {filename} (hash: {file_hash})")
                     
                     # Check if ground truth exists - but don't skip if missing
                     ground_truth_data = None
@@ -1040,16 +1051,23 @@ async def run_evaluation_task(evaluation_id: str, request: EvaluationRequest):
                     api_responses = []
                     for iteration in range(request.iterations):
                         try:
-                            logger.info(f"Running iteration {iteration + 1} for {filename}")
+                            logger.info(f"Evaluation {evaluation_id}: Starting iteration {iteration + 1}/{request.iterations} for {filename} (current progress: {result.completed_iterations}/{result.total_iterations})")
                             api_response = await call_extraction_api(
                                 pdf_content, filename, request.extraction_endpoint,
                                 request.extraction_types, request.oauth_token
                             )
                             api_responses.append(api_response)
-                            logger.info(f"Completed iteration {iteration + 1} for {filename}")
+                            logger.info(f"Evaluation {evaluation_id}: API call completed for iteration {iteration + 1} of {filename}")
                             
                             # Update iteration progress
                             result.completed_iterations += 1
+                            logger.info(f"Evaluation {evaluation_id}: Completed iteration {result.completed_iterations}/{result.total_iterations} (file: {filename}, iteration: {iteration + 1})")
+                            
+                            # Add a delay between iterations to allow frontend polling to see progress
+                            # This helps with progress tracking visibility
+                            if iteration < request.iterations - 1:  # Don't delay after the last iteration
+                                logger.info(f"Evaluation {evaluation_id}: Waiting 5 seconds before next iteration...")
+                                await asyncio.sleep(5.0)  # Increased to 5 seconds for very visible progress
                             
                             # Save iteration response to S3 if responses_uri is provided
                             if request.responses_uri:
@@ -1136,6 +1154,11 @@ async def run_evaluation_task(evaluation_id: str, request: EvaluationRequest):
                     
                     result.completed_files += 1
                     
+                    # Add a small delay between files to make progress visible across multiple files
+                    if len(source_files) > 1 and result.completed_files < len(source_files):
+                        logger.info(f"Evaluation {evaluation_id}: Completed file {result.completed_files}/{len(source_files)}, waiting 3 seconds before next file...")
+                        await asyncio.sleep(3.0)  # Increased to 3 seconds
+                    
                 except Exception as e:
                     result.errors.append(f"Failed to evaluate {filename} ({source_key}): {str(e)}")
             
@@ -1143,6 +1166,8 @@ async def run_evaluation_task(evaluation_id: str, request: EvaluationRequest):
             result.metrics = calculate_overall_metrics(all_scores, all_true_negatives)
             result.documents = document_evaluations
             result.status = "completed"
+            
+            logger.info(f"🏁 Evaluation {evaluation_id} completed successfully! Final state: {result.completed_iterations}/{result.total_iterations} iterations, {result.completed_files}/{result.total_files} files")
             
             logger.info(f"Evaluation {evaluation_id} completed successfully - releasing lock")
             
@@ -1198,6 +1223,19 @@ async def run_evaluation(request: EvaluationRequest, background_tasks: Backgroun
     else:
         logger.info(f"Evaluation {evaluation_run_id} starting - no queue")
     
+    # Calculate total iterations upfront for proper progress tracking
+    # We need to estimate the number of files that will be processed
+    # For now, we'll set a reasonable default and update it in the background task
+    estimated_total_iterations = 0
+    if request.selected_files:
+        estimated_total_iterations = len(request.selected_files) * request.iterations
+        logger.info(f"Evaluation {evaluation_run_id}: Initial estimate based on {len(request.selected_files)} selected files * {request.iterations} iterations = {estimated_total_iterations}")
+    else:
+        # If no specific files selected, we'll estimate based on typical file counts
+        # This will be updated with the actual count in the background task
+        estimated_total_iterations = 10 * request.iterations  # Conservative estimate
+        logger.info(f"Evaluation {evaluation_run_id}: Initial estimate (no file selection) = {estimated_total_iterations}")
+    
     # Initialize evaluation result using evaluation_run_id as key
     evaluation_store[evaluation_run_id] = EvaluationResult(
         evaluation_id=evaluation_run_id,
@@ -1209,7 +1247,7 @@ async def run_evaluation(request: EvaluationRequest, background_tasks: Backgroun
         ),
         total_files=0,
         completed_files=0,
-        total_iterations=0,
+        total_iterations=estimated_total_iterations,
         completed_iterations=0,
         errors=[]
     )
@@ -1224,6 +1262,73 @@ async def run_evaluation(request: EvaluationRequest, background_tasks: Backgroun
         "evaluation_id": evaluation_run_id, 
         "status": "queued" if lock_acquired else "started",
         "message": "Evaluation queued - another evaluation is running" if lock_acquired else "Evaluation started"
+    }
+
+@router.post("/test-progress/", tags=["debug"])
+async def test_progress():
+    """Test endpoint to verify progress tracking works with artificial delays."""
+    test_id = "test-" + str(int(time.time()))
+    
+    # Initialize test evaluation
+    evaluation_store[test_id] = EvaluationResult(
+        evaluation_id=test_id,
+        status="running",
+        documents=[],
+        metrics=EvaluationMetrics(
+            true_positives=0, false_positives=0, false_negatives=0, true_negatives=0,
+            precision=0.0, recall=0.0, f1_score=0.0, accuracy=0.0
+        ),
+        total_files=2,
+        completed_files=0,
+        total_iterations=6,  # 2 files × 3 iterations
+        completed_iterations=0,
+        errors=[]
+    )
+    
+    # Start background task to simulate slow progress
+    async def simulate_progress():
+        try:
+            result = evaluation_store[test_id]
+            logger.info(f"🧪 Test {test_id}: Starting simulation with {result.total_iterations} iterations")
+            
+            for i in range(result.total_iterations):
+                await asyncio.sleep(2.0)  # 2 second delay per iteration
+                result.completed_iterations += 1
+                if i % 3 == 2:  # Every 3rd iteration, increment file count
+                    result.completed_files += 1
+                logger.info(f"🧪 Test {test_id}: Completed iteration {result.completed_iterations}/{result.total_iterations}")
+            
+            result.status = "completed"
+            logger.info(f"🧪 Test {test_id}: Simulation completed!")
+        except Exception as e:
+            logger.error(f"🧪 Test {test_id}: Simulation failed: {e}")
+            result.status = "failed"
+    
+    # Start the simulation in the background
+    asyncio.create_task(simulate_progress())
+    
+    return {
+        "test_id": test_id,
+        "message": "Test progress simulation started",
+        "instructions": f"Poll GET /api/v1/evaluation/{test_id} to see progress"
+    }
+
+@router.get("/debug/evaluation-store/", tags=["debug"])
+async def debug_evaluation_store():
+    """Debug endpoint to see the current evaluation store state."""
+    return {
+        "evaluation_store": {
+            eval_id: {
+                "evaluation_id": result.evaluation_id,
+                "status": result.status,
+                "total_files": result.total_files,
+                "completed_files": result.completed_files,
+                "total_iterations": result.total_iterations,
+                "completed_iterations": result.completed_iterations,
+                "errors": result.errors
+            }
+            for eval_id, result in evaluation_store.items()
+        }
     }
 
 @router.get("/evaluation-status/", response_model=dict, tags=["evaluation"])

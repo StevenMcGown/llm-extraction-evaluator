@@ -140,21 +140,51 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     let interval: number;
     if (currentEvaluationId && isRunningEvaluation) {
       interval = setInterval(async () => {
+        const timestamp = new Date().toLocaleTimeString();
         try {
           const response = await getEvaluationResult(currentEvaluationId);
           const result: EvaluationResult = response.data;
 
+          // Debug logging for iteration tracking
+          console.log(`🔄 [${timestamp}] Polling evaluation ${currentEvaluationId}:`, {
+            status: result.status,
+            completed_iterations: result.completed_iterations,
+            total_iterations: result.total_iterations,
+            completed_files: result.completed_files,
+            total_files: result.total_files
+          });
+
           // Update progress - use iterations for more granular tracking
           const progress = result.total_iterations > 0 ? (result.completed_iterations / result.total_iterations) * 100 : 0;
-          setProgressPercent(progress);
+          console.log(`📊 [${timestamp}] Progress calculation: ${result.completed_iterations}/${result.total_iterations} = ${progress.toFixed(1)}%`);
+          
+          // Defensive check: don't reset progress to 0 if we already have progress and evaluation is still running
+          if (progress > 0 || progressPercent === 0) {
+            setProgressPercent(progress);
+            console.log(`📊 [${timestamp}] Updated progress to ${progress.toFixed(1)}% (bar should be visible: ${isRunningEvaluation || progress > 0})`);
+          } else if (result.status === 'running' && progressPercent > 0) {
+            console.log(`⚠️ [${timestamp}] Keeping existing progress ${progressPercent}% instead of resetting to ${progress}% (bar should be visible: ${isRunningEvaluation || progressPercent > 0})`);
+          }
+          
           setProgressText(`${result.completed_iterations}/${result.total_iterations} iterations completed (${result.completed_files}/${result.total_files} files)`);
           setEvaluationStatus(result.status);
 
           if (result.status === 'completed' || result.status === 'failed') {
+            console.log(`🏁 [${timestamp}] Evaluation finished! Status: ${result.status}, Final progress: ${result.completed_iterations}/${result.total_iterations}`);
             setIsRunningEvaluation(false);
+            console.log(`📊 [${timestamp}] Set isRunningEvaluation to false - this will hide the progress bar`);
+            
             // Set progress to actual completion percentage, not always 100%
             const finalProgress = result.total_iterations > 0 ? (result.completed_iterations / result.total_iterations) * 100 : 100;
             setProgressPercent(finalProgress);
+            console.log(`📊 [${timestamp}] Final progress set to ${finalProgress}% - bar should still be visible for a moment`);
+            
+            // Keep the progress bar visible for 3 seconds after completion
+            setTimeout(() => {
+              console.log(`⏰ [${new Date().toLocaleTimeString()}] Hiding progress bar 3 seconds after completion`);
+              setProgressPercent(0); // This will hide the progress bar since isRunningEvaluation is already false
+            }, 3000);
+            
             if (result.status === 'completed' || result.completed_files > 0) {
               loadEvaluationData(result);
               setHasRealData(true);
@@ -166,16 +196,17 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
           }
         } catch (err: any) {
           console.error('Failed to poll evaluation status:', err);
-          setError('Failed to check evaluation status');
-          setIsRunningEvaluation(false);
+          // Don't hide the progress bar on polling errors - the evaluation might still be running
+          // Just log the error and continue polling
+          console.log(`⚠️ [${timestamp}] Polling error, but keeping evaluation UI visible`);
         }
-      }, 2000);
+      }, 250); // Reduced from 500ms to 250ms for very frequent polling during multiple file processing
     }
 
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [currentEvaluationId, isRunningEvaluation]);
+  }, [currentEvaluationId, isRunningEvaluation, progressPercent]);
 
   const loadExistingEvaluations = async () => {
     try {
@@ -303,7 +334,6 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
         sourceDataPath: settings.sourceDataPath,
         groundTruthPath: settings.groundTruthPath,
         extractionEndpoint: settings.extractionEndpoint,
-        iterations: iterations,
         extractionTypes: extractionTypes,
         excludedFields: excludedFields
       });
@@ -329,9 +359,25 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
         selected_files: selectedFiles // Add selected files to the request
       });
 
+      console.log('🚀 Evaluation started successfully:', response.data);
       setCurrentEvaluationId(response.data.evaluation_id);
       setEvaluationStatus('running');
       setProgressText(`Processing ${selectedFiles.length} selected files...`);
+      
+      // Immediately poll once to get the initial state
+      setTimeout(async () => {
+        try {
+          const initialResponse = await getEvaluationResult(response.data.evaluation_id);
+          const initialResult = initialResponse.data;
+          console.log('🔍 Initial evaluation state:', initialResult);
+          
+          const initialProgress = initialResult.total_iterations > 0 ? (initialResult.completed_iterations / initialResult.total_iterations) * 100 : 0;
+          setProgressPercent(initialProgress);
+          setProgressText(`${initialResult.completed_iterations}/${initialResult.total_iterations} iterations completed (${initialResult.completed_files}/${initialResult.total_files} files)`);
+        } catch (err) {
+          console.error('Failed to get initial evaluation state:', err);
+        }
+      }, 100); // Poll after 100ms to get initial state
     } catch (err: any) {
       console.error('Failed to start evaluation:', err);
       setError(err.response?.data?.detail || 'Failed to start evaluation');
