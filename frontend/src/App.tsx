@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import HealthStatus from './components/common/HealthStatus';
 import { SettingsProvider } from './context/SettingsContext';
 import EvaluationDashboard from './components/evaluation/EvaluationDashboard';
@@ -7,8 +7,23 @@ import Dashboard from './components/dashboard/Dashboard';
 type TabType = 'dashboard' | 'evaluation';
 
 function App() {
-  const [isDarkMode, setIsDarkMode] = useState<boolean>(false);
+  const [isDarkMode, setIsDarkMode] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('isDarkMode');
+      return saved !== null ? saved === 'true' : true;
+    } catch {
+      return true;
+    }
+  });
   const [activeTab, setActiveTab] = useState<TabType>('evaluation');
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('isDarkMode', String(isDarkMode));
+    } catch {
+      // ignore write errors (e.g., storage disabled)
+    }
+  }, [isDarkMode]);
 
   const tabStyle = (isActive: boolean) => ({
     padding: '0.75rem 1.5rem',
