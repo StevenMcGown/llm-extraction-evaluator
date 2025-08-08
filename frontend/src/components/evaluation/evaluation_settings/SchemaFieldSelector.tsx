@@ -6,12 +6,14 @@ interface SchemaFieldSelectorProps {
   schema?: any;
   onChange?: (excludeFields: string[]) => void;
   isDarkMode?: boolean;
+  showExcludedJson?: boolean;
 }
-
+ 
 const SchemaFieldSelector: React.FC<SchemaFieldSelectorProps> = ({
   schema,
   onChange,
-  isDarkMode = false
+  isDarkMode = false,
+  showExcludedJson = true,
 }) => {
   const [excludeFields, setExcludeFields] = useState<string[]>([]);
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
@@ -318,37 +320,39 @@ const SchemaFieldSelector: React.FC<SchemaFieldSelectorProps> = ({
         )}
       </div>
 
-      <div>
-        <div style={{
-          display: 'block',
-          marginBottom: '1rem',
-          color: isDarkMode ? '#ffffff' : '#495057',
-          fontSize: '1.0rem',
-          fontWeight: '600'
-        }}>
-          Excluded Fields (JSON):
+      {showExcludedJson && (
+        <div>
+          <div style={{
+            display: 'block',
+            marginBottom: '1rem',
+            color: isDarkMode ? '#ffffff' : '#495057',
+            fontSize: '1.0rem',
+            fontWeight: '600'
+          }}>
+            Excluded Fields (JSON):
+          </div>
+          <div style={{
+            fontSize: '12px',
+            marginBottom: '8px',
+            color: isDarkMode ? '#9ca3af' : '#6b7280',
+            fontStyle: 'italic'
+          }}>
+            Note: Excluding array container fields (e.g., "/medications/medications/frequency") will exclude that field from ALL array items.
+          </div>
+          <pre style={{
+            backgroundColor: isDarkMode ? '#111827' : '#f3f4f6',
+            border: `1px solid ${isDarkMode ? '#374151' : '#e5e7eb'}`,
+            borderRadius: '4px',
+            padding: '12px',
+            fontSize: '12px',
+            overflow: 'auto',
+            maxHeight: '150px',
+            color: isDarkMode ? '#d1d5db' : '#374151'
+          }}>
+            {JSON.stringify(excludeFields, null, 2)}
+          </pre>
         </div>
-        <div style={{
-          fontSize: '12px',
-          marginBottom: '8px',
-          color: isDarkMode ? '#9ca3af' : '#6b7280',
-          fontStyle: 'italic'
-        }}>
-          Note: Excluding array container fields (e.g., "/medications/medications/frequency") will exclude that field from ALL array items.
-        </div>
-        <pre style={{
-          backgroundColor: isDarkMode ? '#111827' : '#f3f4f6',
-          border: `1px solid ${isDarkMode ? '#374151' : '#e5e7eb'}`,
-          borderRadius: '4px',
-          padding: '12px',
-          fontSize: '12px',
-          overflow: 'auto',
-          maxHeight: '150px',
-          color: isDarkMode ? '#d1d5db' : '#374151'
-        }}>
-          {JSON.stringify(excludeFields, null, 2)}
-        </pre>
-      </div>
+      )}
     </div>
   );
 };

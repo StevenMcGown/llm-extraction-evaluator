@@ -20,6 +20,9 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Import DB helpers
+from .db import _pool, _vars
+
 # Global evaluation lock to prevent concurrent evaluations
 evaluation_lock = asyncio.Lock()
 evaluation_queue = []  # Queue for pending evaluations
@@ -878,6 +881,27 @@ def compare_extraction_results(
 
     return scores, mismatches, true_negatives
 
+def calculate_field_metrics(all_scores: List[Dict[str, float]]) -> Dict[str, Dict[str, int]]:
+    """Calculate TP/FP/FN metrics for each individual field."""
+    field_metrics = {}
+    
+    for scores in all_scores:
+        for field, score in scores.items():
+            if field not in field_metrics:
+                field_metrics[field] = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+            
+            if score >= 0.99:  # Perfect or near-perfect match is TP
+                field_metrics[field]["tp"] += 1
+            elif score == -1.0:  # False Positive (wrong value or unexpected field)
+                field_metrics[field]["fp"] += 1
+            elif score == -2.0:  # False Negative (missing expected field)
+                field_metrics[field]["fn"] += 1
+            elif score > 0.0:  # Partial match is still TP
+                field_metrics[field]["tp"] += 1
+            # Note: scores for true negatives are handled separately and don't appear in individual field scores
+    
+    return field_metrics
+
 def calculate_overall_metrics(all_scores: List[Dict[str, float]], all_true_negatives: List[int] = None) -> EvaluationMetrics:
     """Calculate overall TP/FP/FN metrics from individual field scores."""
     tp = fp = fn = 0
@@ -1162,8 +1186,9 @@ async def run_evaluation_task(evaluation_id: str, request: EvaluationRequest):
                 except Exception as e:
                     result.errors.append(f"Failed to evaluate {filename} ({source_key}): {str(e)}")
             
-            # Calculate overall metrics
+            # Calculate overall metrics and field-level metrics
             result.metrics = calculate_overall_metrics(all_scores, all_true_negatives)
+            field_metrics = calculate_field_metrics(all_scores)
             result.documents = document_evaluations
             result.status = "completed"
             
@@ -1202,6 +1227,114 @@ async def run_evaluation_task(evaluation_id: str, request: EvaluationRequest):
                 except Exception as results_error:
                     print(f"Failed to save evaluation results: {str(results_error)}")
                     result.errors.append(f"Failed to save results to S3: {str(results_error)}")
+            
+            # Persist overall metrics and field metrics to MySQL for dashboarding
+            try:
+                _vars()
+                pool = await _pool()
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        # Insert: store overall metrics per evaluation run
+                        await cur.execute(
+                            """
+                            INSERT INTO evaluation_metrics (
+                                file_id,
+                                overall_precision,
+                                overall_recall,
+                                overall_f1_score,
+                                overall_accuracy,
+                                overall_tp,
+                                overall_tn,
+                                overall_fp,
+                                overall_fn,
+                                ground_truth_file_id,
+                                extraction_run_id,
+                                evaluation_config
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                evaluation_run_id,  # use run id to satisfy NOT NULL
+                                result.metrics.precision,
+                                result.metrics.recall,
+                                result.metrics.f1_score,
+                                result.metrics.accuracy,
+                                result.metrics.true_positives,
+                                result.metrics.true_negatives,
+                                result.metrics.false_positives,
+                                result.metrics.false_negatives,
+                                request.ground_truth_uri,  # ground_truth_file_id
+                                None,  # extraction_run_id (can be NULL)
+                                json.dumps({
+                                    "source_data_uri": request.source_data_uri,
+                                    "ground_truth_uri": request.ground_truth_uri,
+                                    "extraction_endpoint": request.extraction_endpoint,
+                                    "extraction_types": request.extraction_types,
+                                    "excluded_fields": request.excluded_fields,
+                                    "iterations": request.iterations,
+                                    "selected_files": request.selected_files,
+                                }),
+                            ),
+                        )
+                        
+                        # Get the evaluation ID for field performance records
+                        evaluation_id = cur.lastrowid
+                        
+                        # Insert field performance records
+                        logger.info(f"field_metrics contains {len(field_metrics)} fields: {list(field_metrics.keys())}")
+                        for field_name, field_data in field_metrics.items():
+                            # Calculate field-level metrics
+                            tp = field_data.get('tp', 0)
+                            tn = field_data.get('tn', 0)
+                            fp = field_data.get('fp', 0)
+                            fn = field_data.get('fn', 0)
+                            
+                            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                            f1_score = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+                            accuracy = (tp + tn) / (tp + fp + fn + tn) if (tp + fp + fn + tn) > 0 else 0.0
+                            
+                            # Extract field name and path
+                            field_parts = field_name.split('.')
+                            simple_field_name = field_parts[-1] if field_parts else field_name
+                            
+                            logger.info(f"Inserting field performance for {field_name}: tp={tp}, fp={fp}, fn={fn}, tn={tn}")
+                            
+                            await cur.execute(
+                                """
+                                INSERT INTO field_performance (
+                                    evaluation_id,
+                                    field_name,
+                                    field_path,
+                                    tp,
+                                    tn,
+                                    fp,
+                                    fn,
+                                    `precision`,
+                                    recall,
+                                    f1_score,
+                                    accuracy
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """,
+                                (
+                                    evaluation_id,
+                                    simple_field_name,
+                                    field_name,
+                                    tp,
+                                    tn,
+                                    fp,
+                                    fn,
+                                    precision,
+                                    recall,
+                                    f1_score,
+                                    accuracy
+                                ),
+                            )
+                            logger.info(f"Successfully inserted field performance for {field_name}")
+                        
+                pool.close(); await pool.wait_closed()
+                logger.info(f"Saved evaluation metrics and field performance to DB for run {evaluation_run_id}")
+            except Exception as db_error:
+                logger.error(f"Failed to save evaluation metrics to DB: {db_error}")
             
     except Exception as e:
         result = evaluation_store[evaluation_id]
@@ -1383,6 +1516,66 @@ async def list_evaluations():
             for eval_id, result in evaluation_store.items()
         ]
     }
+
+@router.get("/evaluation-metrics/", tags=["evaluation"])
+async def get_evaluation_metrics(limit: int = 100):
+    """Get evaluation metrics from database for dashboard."""
+    try:
+        _vars()
+        pool = await _pool()
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT 
+                        id,
+                        file_id,
+                        evaluation_timestamp,
+                        overall_precision,
+                        overall_recall,
+                        overall_f1_score,
+                        overall_accuracy,
+                        overall_tp,
+                        overall_tn,
+                        overall_fp,
+                        overall_fn,
+                        ground_truth_file_id,
+                        extraction_run_id,
+                        evaluation_config
+                    FROM evaluation_metrics 
+                    ORDER BY evaluation_timestamp DESC 
+                    LIMIT %s
+                    """,
+                    (limit,)
+                )
+                rows = await cur.fetchall()
+                
+                # Convert to list of dictionaries
+                metrics = []
+                for row in rows:
+                    metrics.append({
+                        "id": row[0],
+                        "file_id": row[1],
+                        "evaluation_timestamp": row[2].isoformat() if row[2] else None,
+                        "overall_precision": float(row[3]) if row[3] is not None else None,
+                        "overall_recall": float(row[4]) if row[4] is not None else None,
+                        "overall_f1_score": float(row[5]) if row[5] is not None else None,
+                        "overall_accuracy": float(row[6]) if row[6] is not None else None,
+                        "overall_tp": row[7],
+                        "overall_tn": row[8],
+                        "overall_fp": row[9],
+                        "overall_fn": row[10],
+                        "ground_truth_file_id": row[11],
+                        "extraction_run_id": row[12],
+                        "evaluation_config": json.loads(row[13]) if row[13] else {}
+                    })
+        
+        pool.close(); await pool.wait_closed()
+        return {"metrics": metrics, "count": len(metrics)}
+        
+    except Exception as e:
+        logger.error(f"Failed to get evaluation metrics: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get evaluation metrics: {str(e)}")
 
 @router.get("/evaluation/s3/{run_id}", response_model=EvaluationResult, tags=["evaluation"])
 async def get_evaluation_from_s3(run_id: str, responses_uri: str):

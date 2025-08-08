@@ -5,45 +5,54 @@
 CREATE DATABASE IF NOT EXISTS `llm-extraction-evaluator-ground-truth-test-mysql`;
 USE `llm-extraction-evaluator-ground-truth-test-mysql`;
 
--- Files table - stores uploaded file metadata
-CREATE TABLE IF NOT EXISTS `files` (
-    `file_id` VARCHAR(36) PRIMARY KEY,
-    `file_hash` VARCHAR(64) NOT NULL UNIQUE,
-    `original_name` VARCHAR(255) NOT NULL,
-    `s3_key` VARCHAR(500) NOT NULL,
-    `uploaded_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX `idx_file_hash` (`file_hash`),
-    INDEX `idx_uploaded_at` (`uploaded_at`)
-);
-
--- Ground truths table - stores ground truth data for evaluation
-CREATE TABLE IF NOT EXISTS `ground_truths` (
+-- Evaluation metrics table - stores evaluation results for dashboard graphs
+CREATE TABLE IF NOT EXISTS `evaluation_metrics` (
     `id` INT AUTO_INCREMENT PRIMARY KEY,
     `file_id` VARCHAR(36) NOT NULL,
-    `ground_truth_data` JSON,
-    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (`file_id`) REFERENCES `files`(`file_id`) ON DELETE CASCADE,
-    INDEX `idx_file_id` (`file_id`)
-);
-
--- Extraction runs table - stores extraction results for comparison
-CREATE TABLE IF NOT EXISTS `extraction_runs` (
-    `id` INT AUTO_INCREMENT PRIMARY KEY,
-    `file_id` VARCHAR(36) NOT NULL,
-    `extraction_data` JSON,
-    `model_name` VARCHAR(100),
-    `run_timestamp` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    `execution_time_ms` INT,
-    FOREIGN KEY (`file_id`) REFERENCES `files`(`file_id`) ON DELETE CASCADE,
+    -- `model_name` VARCHAR(100) NOT NULL,
+    `evaluation_timestamp` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+    -- Overall metrics
+    `overall_precision` DECIMAL(5,4),
+    `overall_recall` DECIMAL(5,4),
+    `overall_f1_score` DECIMAL(5,4),
+    `overall_accuracy` DECIMAL(5,4),
+    `overall_tp` INT,
+    `overall_tn` INT,
+    `overall_fp` INT,
+    `overall_fn` INT,
+    
+    -- Additional metadata
+    `ground_truth_file_id` VARCHAR(500),
+    `extraction_run_id` INT,
+    `evaluation_config` JSON,
+    
     INDEX `idx_file_id` (`file_id`),
-    INDEX `idx_model_name` (`model_name`),
-    INDEX `idx_run_timestamp` (`run_timestamp`)
+    INDEX `idx_evaluation_timestamp` (`evaluation_timestamp`),
+    INDEX `idx_ground_truth_file_id` (`ground_truth_file_id`)
 );
 
--- Test table for basic functionality
-CREATE TABLE IF NOT EXISTS `test_table` (
+-- Field performance table - stores individual field metrics for analytics
+CREATE TABLE IF NOT EXISTS `field_performance` (
     `id` INT AUTO_INCREMENT PRIMARY KEY,
-    `ts` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    `evaluation_id` INT NOT NULL,
+    `field_name` VARCHAR(500) NOT NULL,
+    `field_path` VARCHAR(1000) NOT NULL,
+    `tp` INT DEFAULT 0,
+    `tn` INT DEFAULT 0,
+    `fp` INT DEFAULT 0,
+    `fn` INT DEFAULT 0,
+    `precision` DECIMAL(5,4),
+    `recall` DECIMAL(5,4),
+    `f1_score` DECIMAL(5,4),
+    `accuracy` DECIMAL(5,4),
+    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+    FOREIGN KEY (`evaluation_id`) REFERENCES `evaluation_metrics`(`id`) ON DELETE CASCADE,
+    INDEX `idx_evaluation_id` (`evaluation_id`),
+    INDEX `idx_field_name` (`field_name`),
+    INDEX `idx_field_path` (`field_path`),
+    INDEX `idx_created_at` (`created_at`)
 );
 
 -- Display the created tables

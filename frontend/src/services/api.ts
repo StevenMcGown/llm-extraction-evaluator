@@ -80,6 +80,9 @@ export const recalculateEvaluation = (evaluationId: string, groundTruthUri: stri
 
 export const listEvaluations = () => apiClient.get('/evaluations/');
 
+export const getEvaluationMetrics = (limit = 100) => 
+  apiClient.get('/evaluation-metrics/', { params: { limit } });
+
 // ---- Ground Truth Seeding ----
 export const checkMissingGroundTruth = (sourceDataUri: string, groundTruthUri: string) =>
   apiClient.get('/check-missing-ground-truth/', {
