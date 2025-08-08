@@ -8,7 +8,7 @@ type TabType = 'dashboard' | 'evaluation';
 
 function App() {
   const [isDarkMode, setIsDarkMode] = useState<boolean>(false);
-  const [activeTab, setActiveTab] = useState<TabType>('dashboard');
+  const [activeTab, setActiveTab] = useState<TabType>('evaluation');
 
   const tabStyle = (isActive: boolean) => ({
     padding: '0.75rem 1.5rem',
@@ -110,22 +110,6 @@ function App() {
         }}>
           <div style={{ display: 'flex', gap: '0' }}>
             <button
-              style={tabStyle(activeTab === 'dashboard')}
-              onClick={() => setActiveTab('dashboard')}
-              onMouseOver={(e) => {
-                if (activeTab !== 'dashboard') {
-                  (e.target as HTMLElement).style.backgroundColor = isDarkMode ? '#374151' : '#f9fafb';
-                }
-              }}
-              onMouseOut={(e) => {
-                if (activeTab !== 'dashboard') {
-                  (e.target as HTMLElement).style.backgroundColor = 'transparent';
-                }
-              }}
-            >
-              Dashboard
-            </button>
-            <button
               style={tabStyle(activeTab === 'evaluation')}
               onClick={() => setActiveTab('evaluation')}
               onMouseOver={(e) => {
@@ -140,6 +124,22 @@ function App() {
               }}
             >
               Evaluation
+            </button>
+            <button
+              style={tabStyle(activeTab === 'dashboard')}
+              onClick={() => setActiveTab('dashboard')}
+              onMouseOver={(e) => {
+                if (activeTab !== 'dashboard') {
+                  (e.target as HTMLElement).style.backgroundColor = isDarkMode ? '#374151' : '#f9fafb';
+                }
+              }}
+              onMouseOut={(e) => {
+                if (activeTab !== 'dashboard') {
+                  (e.target as HTMLElement).style.backgroundColor = 'transparent';
+                }
+              }}
+            >
+              Dashboard
             </button>
           </div>
         </div>
