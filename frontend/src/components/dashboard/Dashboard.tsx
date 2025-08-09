@@ -68,7 +68,7 @@ const Dashboard: React.FC<DashboardProps> = ({ isDarkMode }) => {
 
       {/* Overview Cards - Full Width */}
       <div style={{ gridColumn: '1 / -1' }}>
-        <OverviewCards isDarkMode={isDarkMode} />
+        <OverviewCards isDarkMode={isDarkMode} excludedFields={excludedFields} />
       </div>
     </div>
   );

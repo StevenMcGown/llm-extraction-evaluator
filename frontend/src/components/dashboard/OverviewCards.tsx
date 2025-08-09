@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
-import { getEvaluationMetrics } from '../../services/api';
+import { getEvaluationMetrics, queryTable } from '../../services/api';
 
 interface OverviewCardsProps {
   isDarkMode: boolean;
+  excludedFields?: string[];
 }
 
 interface EvaluationMetric {
@@ -30,7 +31,7 @@ interface EvaluationMetric {
   };
 }
 
-const OverviewCards: React.FC<OverviewCardsProps> = ({ isDarkMode }) => {
+const OverviewCards: React.FC<OverviewCardsProps> = ({ isDarkMode, excludedFields = [] }) => {
   const [totalEvaluations, setTotalEvaluations] = useState<number>(0);
   const [weeklyChange, setWeeklyChange] = useState<number>(0);
   const [averageAccuracy, setAverageAccuracy] = useState<number>(0);
@@ -38,7 +39,7 @@ const OverviewCards: React.FC<OverviewCardsProps> = ({ isDarkMode }) => {
   const [averageRecall, setAverageRecall] = useState<number>(0);
   const [averageF1, setAverageF1] = useState<number>(0);
   const [documentsProcessed, setDocumentsProcessed] = useState<number>(0);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState<boolean>(false);
 
   useEffect(() => {
     const fetchEvaluationStats = async () => {
@@ -46,7 +47,10 @@ const OverviewCards: React.FC<OverviewCardsProps> = ({ isDarkMode }) => {
         setLoading(true);
         const response = await getEvaluationMetrics(1000);
         const metrics = response.data?.metrics as EvaluationMetric[] | undefined;
-        
+        // Load field_performance rows to compute filtered averages like the chart
+        const fieldResp = await queryTable('field_performance', 5000);
+        const fieldRows = Array.isArray(fieldResp.data?.data) ? fieldResp.data.data : [];
+
         if (Array.isArray(metrics)) {
           // Total evaluations
           setTotalEvaluations(metrics.length);
@@ -73,13 +77,50 @@ const OverviewCards: React.FC<OverviewCardsProps> = ({ isDarkMode }) => {
             }, 0);
           setDocumentsProcessed(documentsLast30Days);
           
-          // Averages (overall)
-          const nums = <T extends number | null | undefined>(arr: (T)[]) => arr.filter(v => v != null && !Number.isNaN(v as number)) as number[];
+          // Averages (filtered): recompute per evaluation from field_performance rows with excludedFields applied
+          const toPtr = (fieldPath: string) => {
+            let ptr = String(fieldPath || '').replace(/\[.*?\]/g, '');
+            ptr = ptr.replace(/\./g, '/');
+            if (!ptr.startsWith('/')) ptr = '/' + ptr;
+            return ptr;
+          };
+          // Build mapping from eval id to label (file_id) to group rows per eval
+          const idToLabel = new Map<number, string>();
+          for (const m of metrics) {
+            const idNum = Number(m.id as any);
+            if (!Number.isNaN(idNum)) idToLabel.set(idNum, String((m as any).file_id ?? idNum));
+          }
+          // Group rows by evaluation_id
+          const byEval = new Map<number, any[]>();
+          for (const r of fieldRows) {
+            const evalId = Number(r.evaluation_id);
+            if (!idToLabel.has(evalId)) continue;
+            const ptr = toPtr(String(r.field_path || ''));
+            if (excludedFields.some(ex => ptr.startsWith(ex))) continue;
+            const arr = byEval.get(evalId) || [];
+            arr.push(r);
+            byEval.set(evalId, arr);
+          }
+          const perEvalMetrics: { precision: number; recall: number; f1: number; acc: number }[] = [];
+          for (const [, rows] of byEval.entries()) {
+            const sums = rows.reduce((acc: any, r: any) => {
+              acc.tp += Number(r.tp ?? 0);
+              acc.fp += Number(r.fp ?? 0);
+              acc.fn += Number(r.fn ?? 0);
+              acc.tn += Number(r.tn ?? 0);
+              return acc;
+            }, { tp: 0, fp: 0, fn: 0, tn: 0 });
+            const precision = (sums.tp + sums.fp) > 0 ? sums.tp / (sums.tp + sums.fp) : 0;
+            const recall = (sums.tp + sums.fn) > 0 ? sums.tp / (sums.tp + sums.fn) : 0;
+            const f1 = (precision + recall) > 0 ? (2 * precision * recall) / (precision + recall) : 0;
+            const acc = (sums.tp + sums.fp + sums.fn + sums.tn) > 0 ? (sums.tp + sums.tn) / (sums.tp + sums.fp + sums.fn + sums.tn) : 0;
+            perEvalMetrics.push({ precision, recall, f1, acc });
+          }
           const avg = (arr: number[]) => arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : 0;
-          setAverageAccuracy(avg(nums(metrics.map(m => m.overall_accuracy))));
-          setAveragePrecision(avg(nums(metrics.map(m => m.overall_precision))));
-          setAverageRecall(avg(nums(metrics.map(m => m.overall_recall))));
-          setAverageF1(avg(nums(metrics.map(m => m.overall_f1_score))));
+          setAveragePrecision(avg(perEvalMetrics.map(m => m.precision)));
+          setAverageRecall(avg(perEvalMetrics.map(m => m.recall)));
+          setAverageF1(avg(perEvalMetrics.map(m => m.f1)));
+          setAverageAccuracy(avg(perEvalMetrics.map(m => m.acc)));
         }
       } catch (error) {
         console.error('Failed to fetch evaluation stats:', error);
@@ -89,7 +130,7 @@ const OverviewCards: React.FC<OverviewCardsProps> = ({ isDarkMode }) => {
     };
 
     fetchEvaluationStats();
-  }, []);
+  }, [excludedFields]);
 
   const cardStyle = {
     background: isDarkMode ? '#1f2937' : '#ffffff',
