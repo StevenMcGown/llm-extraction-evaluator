@@ -80,7 +80,10 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
   const [error, setError] = useState<string | null>(null);
 
   // New state for evaluation controls
-  const [iterations, setIterations] = useState<number>(3);
+  const [iterations, setIterations] = useState<number>(() => {
+    const saved = localStorage.getItem('evaluationIterations');
+    return saved ? parseInt(saved, 10) : 3;
+  });
   const [isRunningEvaluation, setIsRunningEvaluation] = useState<boolean>(false);
   const [currentEvaluationId, setCurrentEvaluationId] = useState<string | null>(null);
   const [evaluationStatus, setEvaluationStatus] = useState<string>('');
@@ -92,19 +95,52 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
   const [progressPercent, setProgressPercent] = useState<number>(0);
   const [progressText, setProgressText] = useState<string>('');
   const [sourceFiles, setSourceFiles] = useState<string[]>([]);
-  const [selectedFiles, setSelectedFiles] = useState<string[]>([]);
+  const [selectedFiles, setSelectedFiles] = useState<string[]>(() => {
+    const saved = localStorage.getItem('evaluationSelectedFiles');
+    return saved ? JSON.parse(saved) : [];
+  });
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [refreshTimestamp, setRefreshTimestamp] = useState<number>(Date.now());
+  const hasInitializedExcludedRefresh = React.useRef<boolean>(false);
   
   // State for loading evaluations by run ID
   const [runIdInput, setRunIdInput] = useState<string>('');
   const [isLoadingRunId, setIsLoadingRunId] = useState<boolean>(false);
 
-
-  // Load existing evaluations on component mount
+  // Save iterations to localStorage when it changes
   useEffect(() => {
-    loadExistingEvaluations();
-  }, []);
+    localStorage.setItem('evaluationIterations', iterations.toString());
+  }, [iterations]);
+
+  // Save selected files to localStorage when they change
+  useEffect(() => {
+    localStorage.setItem('evaluationSelectedFiles', JSON.stringify(selectedFiles));
+  }, [selectedFiles]);
+
+
+  // Load last evaluation (if remembered), otherwise fallback to most recent completed
+  useEffect(() => {
+    const lastId = localStorage.getItem('lastEvaluationId');
+    if (lastId) {
+      getEvaluationResult(lastId)
+        .then(resp => {
+          loadEvaluationData(resp.data);
+          setHasRealData(true);
+        })
+        .catch(() => {
+          // If the remembered ID is not in memory anymore, try S3 loader
+          if (settings.responsesPath) {
+            getEvaluationFromS3(lastId, settings.responsesPath)
+              .then(resp => { loadEvaluationData(resp.data); setHasRealData(true); })
+              .catch(() => loadExistingEvaluations());
+          } else {
+            loadExistingEvaluations();
+          }
+        });
+    } else {
+      loadExistingEvaluations();
+    }
+  }, [settings.responsesPath]);
 
   // Load source files when settings change
   useEffect(() => {
@@ -115,21 +151,43 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
 
   const loadSourceFiles = async () => {
     try {
-      console.log('Loading source files from:', settings.sourceDataPath);
+      // console.log('Loading source files from:', settings.sourceDataPath);
 
       const response = await listSourceFiles(settings.sourceDataPath);
       const files = response.data.files;
 
-      console.log('Received files from backend:', files);
+      // console.log('Received files from backend:', files);
 
       // Extract just the filenames for the UI and sort alphabetically
       const filenames = files.map((file: any) => file.filename).sort();
-      console.log('Setting source files:', filenames);
+      // console.log('Setting source files:', filenames);
       setSourceFiles(filenames);
 
-      // Select all files by default
-      setSelectedFiles(filenames);
-      console.log('Selected files set to:', filenames);
+      // Filter saved selected files to only include files that still exist
+      // If no saved selection exists, select all files by default
+      const savedSelected = localStorage.getItem('evaluationSelectedFiles');
+      if (savedSelected) {
+        try {
+          const savedFiles: string[] = JSON.parse(savedSelected);
+          const validSelectedFiles = savedFiles.filter(file => filenames.includes(file));
+          
+          if (validSelectedFiles.length > 0) {
+            setSelectedFiles(validSelectedFiles);
+            // console.log('Restored saved file selection:', validSelectedFiles);
+          } else {
+            // If no saved files are valid anymore, select all
+            setSelectedFiles(filenames);
+            // console.log('No saved files exist anymore, selecting all files:', filenames);
+          }
+        } catch (error) {
+          console.warn('Failed to parse saved selected files, defaulting to all files');
+          setSelectedFiles(filenames);
+        }
+      } else {
+        // No saved selection, select all files by default
+        setSelectedFiles(filenames);
+        // console.log('No saved selection found, selected all files:', filenames);
+      }
     } catch (error) {
       console.error('Failed to load source files:', error);
       setError('Failed to load source files');
@@ -147,42 +205,42 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
           const result: EvaluationResult = response.data;
 
           // Debug logging for iteration tracking
-          console.log(`🔄 [${timestamp}] Polling evaluation ${currentEvaluationId}:`, {
-            status: result.status,
-            completed_iterations: result.completed_iterations,
-            total_iterations: result.total_iterations,
-            completed_files: result.completed_files,
-            total_files: result.total_files
-          });
+          // console.log(`🔄 [${timestamp}] Polling evaluation ${currentEvaluationId}:`, {
+          //   status: result.status,
+          //   completed_iterations: result.completed_iterations,
+          //   total_iterations: result.total_iterations,
+          //   completed_files: result.completed_files,
+          //   total_files: result.total_files
+          // });
 
           // Update progress - use iterations for more granular tracking
           const progress = result.total_iterations > 0 ? (result.completed_iterations / result.total_iterations) * 100 : 0;
-          console.log(`📊 [${timestamp}] Progress calculation: ${result.completed_iterations}/${result.total_iterations} = ${progress.toFixed(1)}%`);
+          // console.log(`📊 [${timestamp}] Progress calculation: ${result.completed_iterations}/${result.total_iterations} = ${progress.toFixed(1)}%`);
           
           // Defensive check: don't reset progress to 0 if we already have progress and evaluation is still running
           if (progress > 0 || progressPercent === 0) {
             setProgressPercent(progress);
-            console.log(`📊 [${timestamp}] Updated progress to ${progress.toFixed(1)}% (bar should be visible: ${isRunningEvaluation || progress > 0})`);
+            // console.log(`📊 [${timestamp}] Updated progress to ${progress.toFixed(1)}% (bar should be visible: ${isRunningEvaluation || progress > 0})`);
           } else if (result.status === 'running' && progressPercent > 0) {
-            console.log(`⚠️ [${timestamp}] Keeping existing progress ${progressPercent}% instead of resetting to ${progress}% (bar should be visible: ${isRunningEvaluation || progressPercent > 0})`);
+            // console.log(`⚠️ [${timestamp}] Keeping existing progress ${progressPercent}% instead of resetting to ${progress}% (bar should be visible: ${isRunningEvaluation || progressPercent > 0})`);
           }
           
           setProgressText(`${result.completed_iterations}/${result.total_iterations} iterations completed (${result.completed_files}/${result.total_files} files)`);
           setEvaluationStatus(result.status);
 
           if (result.status === 'completed' || result.status === 'failed') {
-            console.log(`🏁 [${timestamp}] Evaluation finished! Status: ${result.status}, Final progress: ${result.completed_iterations}/${result.total_iterations}`);
+            // console.log(`🏁 [${timestamp}] Evaluation finished! Status: ${result.status}, Final progress: ${result.completed_iterations}/${result.total_iterations}`);
             setIsRunningEvaluation(false);
-            console.log(`📊 [${timestamp}] Set isRunningEvaluation to false - this will hide the progress bar`);
+            // console.log(`📊 [${timestamp}] Set isRunningEvaluation to false - this will hide the progress bar`);
             
             // Set progress to actual completion percentage, not always 100%
             const finalProgress = result.total_iterations > 0 ? (result.completed_iterations / result.total_iterations) * 100 : 100;
             setProgressPercent(finalProgress);
-            console.log(`📊 [${timestamp}] Final progress set to ${finalProgress}% - bar should still be visible for a moment`);
+            // console.log(`📊 [${timestamp}] Final progress set to ${finalProgress}% - bar should still be visible for a moment`);
             
             // Keep the progress bar visible for 3 seconds after completion
             setTimeout(() => {
-              console.log(`⏰ [${new Date().toLocaleTimeString()}] Hiding progress bar 3 seconds after completion`);
+              // console.log(`⏰ [${new Date().toLocaleTimeString()}] Hiding progress bar 3 seconds after completion`);
               setProgressPercent(0); // This will hide the progress bar since isRunningEvaluation is already false
             }, 3000);
             
@@ -199,7 +257,7 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
           console.error('Failed to poll evaluation status:', err);
           // Don't hide the progress bar on polling errors - the evaluation might still be running
           // Just log the error and continue polling
-          console.log(`⚠️ [${timestamp}] Polling error, but keeping evaluation UI visible`);
+          // console.log(`⚠️ [${timestamp}] Polling error, but keeping evaluation UI visible`);
         }
       }, 250); // Reduced from 500ms to 250ms for very frequent polling during multiple file processing
     }
@@ -223,21 +281,22 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
         setHasRealData(true);
       }
     } catch (err) {
-      console.log('No existing evaluations found or failed to load');
+      // console.log('No existing evaluations found or failed to load');
       // This is not an error - just means no evaluations exist yet
     }
   };
 
   const loadEvaluationData = (result: EvaluationResult) => {
-    console.log('Raw evaluation result:', result);
-    console.log('Number of documents from backend:', result.documents.length);
-    console.log('Evaluation errors:', result.errors);
-    console.log('Total files found:', result.total_files);
-    console.log('Completed files:', result.completed_files);
+    // console.log('Raw evaluation result:', result);
+    // console.log('Number of documents from backend:', result.documents.length);
+    // console.log('Evaluation errors:', result.errors);
+    // console.log('Total files found:', result.total_files);
+    // console.log('Completed files:', result.completed_files);
 
-    // Set current evaluation ID if available in result
+    // Set current evaluation ID if available in result and remember it
     if (result.evaluation_id) {
       setCurrentEvaluationId(result.evaluation_id);
+      try { localStorage.setItem('lastEvaluationId', result.evaluation_id); } catch {}
     }
 
     // Convert backend format to frontend format
@@ -252,10 +311,11 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
       iteration_mismatches: doc.iteration_mismatches || []
     }));
 
-    console.log('Mapped documents for frontend:', mappedDocuments);
+    // console.log('Mapped documents for frontend:', mappedDocuments);
     setDocuments(mappedDocuments);
 
     // Map backend metrics to frontend format
+    // console.log('Raw metrics from backend:', result.metrics);
     const mappedMetrics: EvaluationMetrics = {
       truePositives: result.metrics.true_positives,
       falsePositives: result.metrics.false_positives,
@@ -266,6 +326,7 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
       f1Score: result.metrics.f1_score,
       accuracy: result.metrics.accuracy,
     };
+    // console.log('Mapped metrics for frontend:', mappedMetrics);
     setMetrics(mappedMetrics);
 
     // Generate issues log from all document mismatches
@@ -277,111 +338,59 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     });
     setCalculationLog(allMismatches);
 
-    // Recompute metrics from DB rows (field_performance) like the dashboard, so both views match
-    recomputeMetricsFromDb(result.evaluation_id, excludedFields).catch(() => {});
+    // DB-based recomputation disabled: rely exclusively on live in-memory metrics
+    // (previously triggered recomputeMetricsFromDb here)
 
     // Emit structured logs similar to dashboard
     try {
-      const toPointer = (fieldPath: string) => {
-        let ptr = fieldPath.replace(/\[.*?\]/g, '');
-        ptr = ptr.replace(/\./g, '/');
-        if (!ptr.startsWith('/')) ptr = '/' + ptr;
-        return ptr;
-      };
-      const isExcluded = (ptr: string) => excludedFields.some(ex => ptr.startsWith(ex));
-      // Prefer last iteration scores if available; otherwise use doc.scores
-      const selectScores = (doc: DocumentResult): Record<string, number> => {
-        if (doc.iteration_scores && doc.iteration_scores.length > 0) {
-          return doc.iteration_scores[doc.iteration_scores.length - 1] as Record<string, number>;
-        }
-        return doc.scores || {};
-      };
-      // Build per-pointer counts from scores using same thresholds as backend
-      type Cnts = { tp: number; fp: number; fn: number; tn: number };
-      const perPtr: Map<string, Cnts> = new Map();
-      for (const doc of mappedDocuments) {
-        const scores = selectScores(doc);
-        for (const [fieldPath, score] of Object.entries(scores)) {
-          const ptr = toPointer(fieldPath);
-          if (isExcluded(ptr)) continue;
-          const cur = perPtr.get(ptr) || { tp: 0, fp: 0, fn: 0, tn: 0 };
-          if (score >= 0.99) cur.tp += 1;
-          else if (score === -1.0) cur.fp += 1;
-          else if (score === -2.0) cur.fn += 1;
-          else if (score > 0.0) cur.tp += 1; // partial -> TP
-          perPtr.set(ptr, cur);
-        }
-      }
-      // Overall log
-      console.log('EvaluationPage.Overall JSON\n' + JSON.stringify({
-        tag: 'EvaluationPage.Overall',
-        excludedFields,
-        counts: {
-          tp: mappedMetrics.truePositives,
-          fp: mappedMetrics.falsePositives,
-          fn: mappedMetrics.falseNegatives,
-          tn: mappedMetrics.trueNegatives,
-        },
-        metrics: {
-          precision: +mappedMetrics.precision.toFixed(6),
-          recall: +mappedMetrics.recall.toFixed(6),
-          f1Score: +mappedMetrics.f1Score.toFixed(6),
-          accuracy: +mappedMetrics.accuracy.toFixed(6),
-        }
-      }, null, 2));
+      // Colored per-field console logging for TP / FP / FN (TN is aggregated)
+      const logPerField = () => {
+        const styleTP = 'color:#065f46;font-weight:600';
+        const styleFP = 'color:#991b1b;font-weight:600';
+        const styleFN = 'color:#92400e;font-weight:600';
+        const styleTN = 'color:#475569;font-weight:600';
 
-      // Remaining errors per pointer
-      const errorItems = Array.from(perPtr.entries())
-        .map(([ptr, c]) => ({ ptr, tp: c.tp, fp: c.fp, fn: c.fn, tn: c.tn, errors: (c.fp || 0) + (c.fn || 0) }))
-        .filter(x => x.errors > 0)
-        .sort((a, b) => b.errors - a.errors)
-        .slice(0, 50);
-      const totals = errorItems.reduce((acc, it) => { acc.fp += it.fp; acc.fn += it.fn; return acc; }, { fp: 0, fn: 0 });
-      console.log('EvaluationPage.RemainingErrors JSON\n' + JSON.stringify({
-        tag: 'EvaluationPage.RemainingErrors',
-        excludedFields,
-        totals,
-        topPointers: errorItems
-      }, null, 2));
-
-      // MedNameErrors like dashboard
-      const medNameItems = errorItems.filter(it => it.ptr.includes('/medications/medications/') && it.ptr.endsWith('/med_name'));
-      if (medNameItems.length > 0) {
-        // try to derive semantic key from original field path by finding matching pointer
-        const medDetails: any[] = [];
+        console.groupCollapsed('%cPer-field Confusion (iteration view where available)', 'color:#2563eb');
         for (const doc of mappedDocuments) {
-          const scores = selectScores(doc);
-          for (const fieldPath of Object.keys(scores)) {
-            if (fieldPath.includes('medications.medications[') && fieldPath.endsWith('.med_name')) {
-              const ptr = toPointer(fieldPath);
-              if (isExcluded(ptr)) continue;
-              const m = fieldPath.match(/medications\.medications\[(.*?)\]\.med_name/);
-              const key = m?.[1] || '';
-              const [name, dosage, frequency] = key.split('|');
-              const cnt = perPtr.get(ptr) || { tp: 0, fp: 0, fn: 0, tn: 0 };
-              if ((cnt.fp || 0) + (cnt.fn || 0) > 0) {
-                medDetails.push({ field_path: fieldPath, semantic_key: key, name: name || '', dosage: dosage || '', frequency: frequency || '', tp: cnt.tp, fp: cnt.fp, fn: cnt.fn, tn: cnt.tn, errors: (cnt.fp || 0) + (cnt.fn || 0) });
-              }
-            }
+          const scores = (doc.iteration_scores && doc.iteration_scores[0]) ? doc.iteration_scores[0] : doc.scores || {};
+          const tp: string[] = [];
+          const fp: string[] = [];
+          const fn: string[] = [];
+
+          for (const [path, score] of Object.entries(scores)) {
+            if (score >= 0.99 || score > 0.0) tp.push(path);
+            else if (score === -1.0) fp.push(path);
+            else if (score === -2.0) fn.push(path);
           }
+
+          console.groupCollapsed(`%c${doc.filename} (${doc.fileHash.slice(0,8)}...)`, 'color:#374151');
+          for (const p of tp) console.log('%c[TP]', styleTP, p);
+          for (const p of fp) console.log('%c[FP]', styleFP, p);
+          for (const p of fn) console.log('%c[FN]', styleFN, p);
+          // TNs are not emitted per field by backend; show aggregated total instead
+          console.log('%c[TN] aggregated total:', styleTN, mappedMetrics.trueNegatives);
+          console.groupEnd();
         }
-        console.log('EvaluationPage.MedNameErrors JSON\n' + JSON.stringify({ tag: 'EvaluationPage.MedNameErrors', excludedFields, items: medDetails.slice(0, 50) }, null, 2));
-      }
+        console.groupEnd();
+      };
+      logPerField();
     } catch {}
 
     setError(null);
   };
 
   // Compute metrics from DB rows just like the dashboard (ensures parity)
+  // DB recompute disabled (no-op). Keeping the signature to avoid refactor ripple.
   const recomputeMetricsFromDb = async (runId: string | null, excluded: string[]) => {
+    return;
     if (!runId) return;
     // 1) Fetch field_performance rows and evaluation_metrics mapping
-    const [fieldResp, metricsResp] = await Promise.all([
-      queryTable('field_performance', 5000),
-      getEvaluationMetrics(1000),
-    ]);
-    const fieldRows = Array.isArray(fieldResp.data?.data) ? fieldResp.data.data : [];
-    const metricsRows = Array.isArray(metricsResp.data?.metrics) ? metricsResp.data.metrics : [];
+    // const [fieldResp, metricsResp] = await Promise.all([
+    //   queryTable('field_performance', 5000),
+    //   getEvaluationMetrics(1000),
+    // ]);
+    const fieldRows: any[] = [];
+    const metricsRows: any[] = [];
 
     // 2) Map evaluation_metrics.id -> label (file_id or run label), find id for this run
     const evalIdForRun = (() => {
@@ -409,7 +418,7 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
       return !excluded.some(ex => ptr.startsWith(ex));
     });
 
-    // 5) Sum counts and compute metrics (same as dashboard and backend)
+    // 5) Sum counts for TP/FP/FN/TN directly from field rows
     const sums = filtered.reduce((acc: any, r: any) => {
       acc.tp += Number(r.tp ?? 0);
       acc.fp += Number(r.fp ?? 0);
@@ -417,16 +426,19 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
       acc.tn += Number(r.tn ?? 0);
       return acc;
     }, { tp: 0, fp: 0, fn: 0, tn: 0 });
+
+    const tn = sums.tn;
+
     const precision = (sums.tp + sums.fp) > 0 ? sums.tp / (sums.tp + sums.fp) : 0;
     const recall = (sums.tp + sums.fn) > 0 ? sums.tp / (sums.tp + sums.fn) : 0;
     const f1Score = (precision + recall) > 0 ? (2 * precision * recall) / (precision + recall) : 0;
-    const accuracy = (sums.tp + sums.fp + sums.fn + sums.tn) > 0 ? (sums.tp + sums.tn) / (sums.tp + sums.fp + sums.fn + sums.tn) : 0;
+    const accuracy = (sums.tp + sums.fp + sums.fn + tn) > 0 ? (sums.tp + tn) / (sums.tp + sums.fp + sums.fn + tn) : 0;
 
     setMetrics({
       truePositives: sums.tp,
       falsePositives: sums.fp,
       falseNegatives: sums.fn,
-      trueNegatives: sums.tn,
+      trueNegatives: tn,
       precision,
       recall,
       f1Score,
@@ -445,12 +457,12 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     } catch {}
   };
 
-  // When exclusions change and we have a current evaluation, recompute metrics from DB rows
-  useEffect(() => {
-    if (currentEvaluationId) {
-      recomputeMetricsFromDb(currentEvaluationId, excludedFields).catch(() => {});
-    }
-  }, [currentEvaluationId, excludedFields]);
+  // DB-based recomputation disabled. If needed later, re-enable and ensure DB rows are complete.
+  // useEffect(() => {
+  //   if (currentEvaluationId && hasRealData) {
+  //     recomputeMetricsFromDb(currentEvaluationId, excludedFields).catch(() => {});
+  //   }
+  // }, [currentEvaluationId, excludedFields, hasRealData]);
 
   const loadEvaluationByRunId = async () => {
     if (!runIdInput.trim()) {
@@ -467,11 +479,11 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     setError(null);
 
     try {
-      console.log('Loading evaluation by run ID:', runIdInput);
+      // console.log('Loading evaluation by run ID:', runIdInput);
       const response = await getEvaluationFromS3(runIdInput.trim(), settings.responsesPath);
       const result = response.data;
       
-      console.log('Loaded evaluation from S3:', result);
+      // console.log('Loaded evaluation from S3:', result);
       loadEvaluationData(result);
       setHasRealData(true);
       
@@ -503,22 +515,22 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     setProgressText(`Processing ${selectedFiles.length} selected files...`);
 
     try {
-      console.log('Starting evaluation with selected files:', selectedFiles);
-      console.log('Settings:', {
-        sourceDataPath: settings.sourceDataPath,
-        groundTruthPath: settings.groundTruthPath,
-        extractionEndpoint: settings.extractionEndpoint,
-        extractionTypes: extractionTypes,
-        excludedFields: excludedFields
-      });
+      // console.log('Starting evaluation with selected files:', selectedFiles);
+      // console.log('Settings:', {
+      //   sourceDataPath: settings.sourceDataPath,
+      //   groundTruthPath: settings.groundTruthPath,
+      //   extractionEndpoint: settings.extractionEndpoint,
+      //   extractionTypes: extractionTypes,
+      //   excludedFields: excludedFields
+      // });
 
       if (excludedFields.length > 0) {
-        console.log('🔍 Excluded fields that will be ignored in evaluation:');
+        // console.log('🔍 Excluded fields that will be ignored in evaluation:');
         excludedFields.forEach((field, index) => {
-          console.log(`  ${index + 1}. ${field}`);
+          // console.log(`  ${index + 1}. ${field}`);
         });
       } else {
-        console.log('ℹ️ No fields excluded - all selected extraction types will be fully evaluated');
+        // console.log('ℹ️ No fields excluded - all selected extraction types will be fully evaluated');
       }
 
       const response = await runEvaluation({
@@ -533,7 +545,7 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
         selected_files: selectedFiles // Add selected files to the request
       });
 
-      console.log('🚀 Evaluation started successfully:', response.data);
+      // console.log('🚀 Evaluation started successfully:', response.data);
       setCurrentEvaluationId(response.data.evaluation_id);
       setEvaluationStatus('running');
       setProgressText(`Processing ${selectedFiles.length} selected files...`);
@@ -543,7 +555,7 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
         try {
           const initialResponse = await getEvaluationResult(response.data.evaluation_id);
           const initialResult = initialResponse.data;
-          console.log('🔍 Initial evaluation state:', initialResult);
+          // console.log('🔍 Initial evaluation state:', initialResult);
           
           const initialProgress = initialResult.total_iterations > 0 ? (initialResult.completed_iterations / initialResult.total_iterations) * 100 : 0;
           setProgressPercent(initialProgress);
@@ -568,16 +580,7 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
   const handleRefreshCalculations = useCallback(async () => {
     if (!currentEvaluationId || !settings.groundTruthPath || !settings.responsesPath) return;
 
-    console.log('🔄 Recalculating evaluation with current settings...');
-    console.log('Extraction types:', extractionTypes);
-    if (excludedFields.length > 0) {
-      console.log('🔍 Excluded fields for recalculation:');
-      excludedFields.forEach((field, index) => {
-        console.log(`  ${index + 1}. ${field}`);
-      });
-    } else {
-      console.log('ℹ️ No fields excluded for recalculation');
-    }
+    // Always recalculate on demand (e.g., after GT save)
 
     setIsRefreshing(true);
     try {
@@ -589,10 +592,6 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
 
       // Force re-render of components by updating timestamp
       setRefreshTimestamp(Date.now());
-
-      // Optional: Show success message or toast
-      console.log('Calculations refreshed successfully');
-
     } catch (error: any) {
       console.error('Failed to refresh calculations:', error);
       setError('Failed to refresh calculations: ' + (error.response?.data?.detail || error.message));
@@ -601,21 +600,24 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     }
   }, [currentEvaluationId, settings.groundTruthPath, settings.responsesPath, extractionTypes, excludedFields]);
 
-  // Auto-refresh calculations when excluded fields change
+  // Auto-refresh calculations when excluded fields change or after GT save
   useEffect(() => {
-    // Only auto-refresh if we have a current evaluation and real data
-    if (!currentEvaluationId || !hasRealData || !settings.groundTruthPath || !settings.responsesPath) {
+    if (!currentEvaluationId || !settings.groundTruthPath || !settings.responsesPath) {
       return;
     }
 
-    // Debounce the refresh to avoid too many API calls
+    // Skip initial mount to avoid overwriting initial metrics with a recalc
+    if (!hasInitializedExcludedRefresh.current) {
+      hasInitializedExcludedRefresh.current = true;
+      return;
+    }
+
     const timeoutId = setTimeout(() => {
-      console.log('🔄 Auto-refreshing calculations due to schema field changes...');
       handleRefreshCalculations();
-    }, 1000); // 1 second debounce
+    }, 600); // slight debounce
 
     return () => clearTimeout(timeoutId);
-  }, [excludedFields, currentEvaluationId, hasRealData, settings.groundTruthPath, settings.responsesPath, handleRefreshCalculations]);
+  }, [excludedFields, currentEvaluationId, settings.groundTruthPath, settings.responsesPath, handleRefreshCalculations]);
 
 
 

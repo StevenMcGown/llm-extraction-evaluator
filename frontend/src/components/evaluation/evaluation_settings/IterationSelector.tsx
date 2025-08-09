@@ -16,6 +16,14 @@ const IterationSelector: React.FC<IterationSelectorProps> = ({
     <div>
       <SectionHeader isDarkMode={isDarkMode}>
         Number of Iterations
+        <span style={{ 
+          fontSize: '0.75rem', 
+          color: isDarkMode ? '#9ca3af' : '#6b7280',
+          fontWeight: 'normal',
+          marginLeft: '0.5rem'
+        }}>
+          (saved)
+        </span>
       </SectionHeader>
       <input
         type="number"

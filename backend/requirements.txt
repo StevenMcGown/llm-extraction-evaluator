@@ -6,4 +6,5 @@ asyncpg
 aiomysql
 python-multipart
 aiohttp
-python-Levenshtein 
+python-Levenshtein
+pytest 

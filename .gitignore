@@ -50,3 +50,4 @@ frontend/src/schema.json
 *.db 
 
 node_modules/
+backend/tests/

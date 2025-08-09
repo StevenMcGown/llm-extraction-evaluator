@@ -416,11 +416,45 @@ const DocumentResultsViewer: React.FC<Props> = ({
               const valStr = String(v).toLowerCase();
               for (const entry of mismatchInfo.valueBased) {
                 if (entry.basePathRe.test(full)) {
-                  // Check if this is compound format (dosage|value)
+                  // Extract array index if present, and ensure we only highlight the exact item index
+                  const arrayIndexMatch = full.match(/^(.*)\[(\d+)\]\.([^\.]+)/);
+                  const bracketKeyMain = entry.bracketValue.split('|')[0]?.toLowerCase().trim();
+
+                  if (arrayIndexMatch && bracketKeyMain) {
+                    const arrBase = arrayIndexMatch[1];
+                    const arrIdx = parseInt(arrayIndexMatch[2]);
+                    // const arrField = arrayIndexMatch[3];
+
+                    // Handle medications.medications by matching stable key (med_name)
+                    if (arrBase === 'medications.medications') {
+                      const item = currentRootData?.medications?.medications?.[arrIdx];
+                      const itemKey = String(item?.med_name || '').toLowerCase().trim();
+                      if (item && itemKey === bracketKeyMain) {
+                        // For compound format (dosage|value), also validate value when provided
+                        if (entry.bracketValue.includes('|')) {
+                          const parts = entry.bracketValue.split('|');
+                          const expectedValue = (parts[1] || '').toLowerCase().trim();
+                          if (valStr === expectedValue) {
+                            highlight = entry.type;
+                            console.log('✅ index+value match', { full, value: v, med_name: item.med_name, expected: entry.bracketValue });
+                            break;
+                          }
+                        } else {
+                          highlight = entry.type;
+                          console.log('✅ index+key match', { full, med_name: item.med_name, expectedKey: bracketKeyMain });
+                          break;
+                        }
+                      } else {
+                        // Wrong item index; don't color this field for this entry
+                        continue;
+                      }
+                    }
+                  }
+
+                  // Existing compound/pipe formats
                   if (entry.bracketValue.includes('|')) {
                     const [dosage, expectedValue] = entry.bracketValue.split('|');
                     
-                    // For compound format, check both dosage and value match
                     if (full.match(/medications\.medications\[\d+\]\./)) {
                       const indexMatch = full.match(/medications\.medications\[(\d+)\]\./);
                       if (indexMatch) {
@@ -434,7 +468,6 @@ const DocumentResultsViewer: React.FC<Props> = ({
                       }
                     }
                   } else {
-                    // For pipe-bracket format, check if this field belongs to a medication with the expected dosage
                     if (full.match(/medications\.medications\[\d+\]\./)) {
                       const indexMatch = full.match(/medications\.medications\[(\d+)\]\./);
                       if (indexMatch) {
@@ -447,7 +480,6 @@ const DocumentResultsViewer: React.FC<Props> = ({
                         }
                       }
                     } else if (valStr === entry.bracketValue.toLowerCase()) {
-                      // Original exact value matching
                       highlight = entry.type;
                       console.log('✅ value-based match', { full, value: v, entry: entry.basePathRe.toString(), bracketValue: entry.bracketValue });
                       break;

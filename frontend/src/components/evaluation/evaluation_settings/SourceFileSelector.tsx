@@ -17,7 +17,17 @@ const SourceFileSelector: React.FC<SourceFileSelectorProps> = ({
 }) => {
   return (
     <div>
-      <SectionHeader isDarkMode={isDarkMode}>Source Files</SectionHeader>
+      <SectionHeader isDarkMode={isDarkMode}>
+        Source Files
+        <span style={{ 
+          fontSize: '0.75rem', 
+          color: isDarkMode ? '#9ca3af' : '#6b7280',
+          fontWeight: 'normal',
+          marginLeft: '0.5rem'
+        }}>
+          (selection saved)
+        </span>
+      </SectionHeader>
       
       {/* File Uploader */}
       <div style={{ marginBottom: '1rem' }}>
