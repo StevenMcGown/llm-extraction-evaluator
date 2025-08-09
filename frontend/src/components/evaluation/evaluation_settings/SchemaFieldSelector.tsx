@@ -24,6 +24,13 @@ const SchemaFieldSelector: React.FC<SchemaFieldSelectorProps> = ({
     if (onChange) {
       onChange(excludeFields);
     }
+    try {
+      const summary = {
+        excludedCount: excludeFields.length,
+        excludedSample: excludeFields.slice(0, 10),
+      };
+      console.log('[SchemaFieldSelector] Excluded fields updated', summary);
+    } catch {}
   }, [excludeFields, onChange]);
 
   const toggleExpanded = (path: string) => {
@@ -39,10 +46,12 @@ const SchemaFieldSelector: React.FC<SchemaFieldSelectorProps> = ({
   const toggleField = (jsonPointer: string) => {
     setExcludeFields(prev => {
       if (prev.includes(jsonPointer)) {
+        console.log('[SchemaFieldSelector] Include field', { jsonPointer });
         // Including a field - remove it and all its children
         console.log(`✅ Including field in evaluation: ${jsonPointer}`);
         return prev.filter(field => !field.startsWith(jsonPointer));
       } else {
+        console.log('[SchemaFieldSelector] Exclude field', { jsonPointer });
         // Excluding a field - add it and all its children
         console.log(`🌟 Excluding field from ALL array items: ${jsonPointer}`);
         const newExcluded = [...prev, jsonPointer];
@@ -77,7 +86,9 @@ const SchemaFieldSelector: React.FC<SchemaFieldSelectorProps> = ({
           addChildFields(value, `/${key}`);
         });
 
-        return [...new Set(newExcluded)]; // Remove duplicates
+        const deduped = [...new Set(newExcluded)];
+        console.log('[SchemaFieldSelector] New excluded fields count', { before: prev.length, after: deduped.length });
+        return deduped; // Remove duplicates
       }
     });
   };

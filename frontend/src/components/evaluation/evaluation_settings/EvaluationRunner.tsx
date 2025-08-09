@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { listFiles, downloadFile, uploadGroundTruth } from '../services/api';
-import { useSettings } from '../context/SettingsContext';
+import { listFiles, downloadFile, uploadGroundTruth } from '../../../services/api';
+import { useSettings } from '../../../context/SettingsContext';
 
 interface ExtractionJob {
   fileKey: string;
@@ -80,14 +80,8 @@ const EvaluationRunner: React.FC = () => {
     const formData = new FormData();
     formData.append('file', pdfBlob, job.fileName);
 
-    // Build URL with query parameters
+    // Build base URL
     const baseUrl = settings.extractionEndpoint.endsWith('/') ? settings.extractionEndpoint : settings.extractionEndpoint + '/';
-    const url = new URL(baseUrl + 'api/v1/process/');
-    url.searchParams.append('extraction_types', 'patient_profile');
-    url.searchParams.append('extraction_types', 'icd10_codes');
-    url.searchParams.append('extraction_types', 'medications');
-    url.searchParams.append('extraction_types', 'allergy');
-    url.searchParams.append('datacontext', 'evaluation');
 
     // Prepare headers
     const headers: Record<string, string> = {
@@ -98,17 +92,90 @@ const EvaluationRunner: React.FC = () => {
       headers['Authorization'] = `Bearer ${settings.oauthToken}`;
     }
 
-    const response = await fetch(url.toString(), {
+    // Helper to extract GUID from various possible keys
+    const extractGuid = (obj: any): string | undefined => {
+      if (!obj) return undefined;
+      const direct = obj.guid || obj.id || obj.job_id || obj.task_id || obj.JobId;
+      if (direct) return direct;
+      for (const [k, v] of Object.entries(obj)) {
+        if (typeof k === 'string' && ['guid','id','job_id','task_id','jobid'].includes(k.toLowerCase())) {
+          return v as string;
+        }
+      }
+      return undefined;
+    };
+
+    // 1) Upload
+    const uploadUrl = new URL(baseUrl + 'api/v1/upload/');
+    uploadUrl.searchParams.append('extraction_types', 'patient_profile');
+    uploadUrl.searchParams.append('extraction_types', 'icd10_codes');
+    uploadUrl.searchParams.append('extraction_types', 'medications');
+    uploadUrl.searchParams.append('extraction_types', 'allergy');
+    uploadUrl.searchParams.append('datacontext', 'eval_testing');
+
+    const uploadResp = await fetch(uploadUrl.toString(), {
       method: 'POST',
       headers,
       body: formData,
     });
 
-    if (!response.ok) {
-      throw new Error(`Extraction failed: ${response.status} ${response.statusText}`);
+    if (!uploadResp.ok) {
+      throw new Error(`Upload failed: ${uploadResp.status} ${uploadResp.statusText}`);
     }
 
-    return await response.json();
+    const uploadJson = await uploadResp.json();
+    const guid = extractGuid(uploadJson);
+    if (!guid) {
+      throw new Error(`Upload response missing GUID: ${JSON.stringify(uploadJson)}`);
+    }
+
+    // 2) Poll status
+    const statusUrl = new URL(baseUrl + `api/v1/status/${guid}`);
+    const maxWaitMs = 10 * 60 * 1000; // 10 minutes
+    const pollBaseMs = 1500;
+    const pollMaxMs = 5000;
+    let waited = 0;
+    let delay = pollBaseMs;
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const statusResp = await fetch(statusUrl.toString(), { headers });
+      if (!statusResp.ok) {
+        // Treat as transient for a short while
+        await new Promise(r => setTimeout(r, delay));
+        waited += delay;
+        delay = Math.min(pollMaxMs, Math.floor(delay * 1.5));
+        if (waited > maxWaitMs) {
+          throw new Error(`Status polling timed out after ${Math.round(maxWaitMs/1000)}s`);
+        }
+        continue;
+      }
+
+      const statusJson = await statusResp.json();
+      const statusVal = String(statusJson.status || '').toLowerCase();
+      if (['completed', 'complete', 'done', 'finished', 'success'].includes(statusVal)) {
+        break;
+      }
+      if (['failed', 'error'].includes(statusVal)) {
+        throw new Error(`Extraction failed for ${job.fileName}: ${JSON.stringify(statusJson)}`);
+      }
+
+      await new Promise(r => setTimeout(r, delay));
+      waited += delay;
+      delay = Math.min(pollMaxMs, Math.floor(delay * 1.5));
+      if (waited > maxWaitMs) {
+        throw new Error(`Status polling timed out after ${Math.round(maxWaitMs/1000)}s`);
+      }
+    }
+
+    // 3) Retrieve
+    const retrieveUrl = new URL(baseUrl + `api/v1/retrieve/${guid}`);
+    const retrieveResp = await fetch(retrieveUrl.toString(), { headers });
+    if (!retrieveResp.ok) {
+      throw new Error(`Retrieve failed: ${retrieveResp.status} ${retrieveResp.statusText}`);
+    }
+
+    return await retrieveResp.json();
   };
 
   const generateEvaluationRunId = () => {
@@ -171,51 +238,39 @@ const EvaluationRunner: React.FC = () => {
     // Save evaluation metadata
     await saveEvaluationMetadata(evaluationRunId);
 
-    for (let i = 0; i < jobs.length; i++) {
-      const job = jobs[i];
-      
-      // Update job status to running
-      setJobs(prev => prev.map((j, idx) => 
-        idx === i ? { ...j, status: 'running', startTime: new Date() } : j
-      ));
+    const CONCURRENCY = 4;
+    let cursor = 0;
 
-      try {
-        // Run extraction
-        const extractionResult = await runExtraction(job);
-        
-        // Find next run number (check existing runs and increment)
-        const runNumber = 1; // For now, start with 1. Could be enhanced to check existing runs.
-        
-        // Save response
-        await saveResponse(job, extractionResult, runNumber, evaluationRunId);
+    const worker = async () => {
+      while (true) {
+        let index: number;
+        let job: ExtractionJob | undefined;
+        // get next job
+        ({ index, job } = (() => {
+          if (cursor >= jobs.length) return { index: -1, job: undefined };
+          const i = cursor;
+          cursor += 1;
+          return { index: i, job: jobs[i] };
+        })());
+        if (job === undefined || index === -1) break;
 
-        // Update job status to completed
-        setJobs(prev => prev.map((j, idx) => 
-          idx === i ? { 
-            ...j, 
-            status: 'completed', 
-            runNumber,
-            endTime: new Date() 
-          } : j
-        ));
-
-      } catch (err: any) {
-        console.error('Extraction failed for', job.fileName, err);
-        
-        // Update job status to failed
-        setJobs(prev => prev.map((j, idx) => 
-          idx === i ? { 
-            ...j, 
-            status: 'failed', 
-            error: err.message,
-            endTime: new Date() 
-          } : j
-        ));
+        // mark running
+        setJobs(prev => prev.map((j, idx) => idx === index ? { ...j, status: 'running', startTime: new Date() } : j));
+        try {
+          const extractionResult = await runExtraction(job);
+          const runNumber = 1;
+          await saveResponse(job, extractionResult, runNumber, evaluationRunId);
+          setJobs(prev => prev.map((j, idx) => idx === index ? { ...j, status: 'completed', runNumber, endTime: new Date() } : j));
+        } catch (err: any) {
+          console.error('Extraction failed for', job.fileName, err);
+          setJobs(prev => prev.map((j, idx) => idx === index ? { ...j, status: 'failed', error: err?.message || String(err), endTime: new Date() } : j));
+        }
       }
+    };
 
-      // Small delay between jobs to avoid overwhelming the API
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
+    // Launch workers
+    const workers = Array.from({ length: Math.min(CONCURRENCY, jobs.length) }, () => worker());
+    await Promise.all(workers);
 
     setIsRunning(false);
   };

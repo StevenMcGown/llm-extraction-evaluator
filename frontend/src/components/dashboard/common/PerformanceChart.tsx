@@ -59,9 +59,23 @@ const SERIES_COLORS = [
 const chartColors = {
   precision: '#3b82f6',
   recall: '#10b981',
-  f1Score: '#8b5cf6',
-  accuracy: '#f59e0b'
+  f1Score: '#f59e0b',
+  accuracy: '#8b5cf6'
 } as const;
+
+// Tooltip label mapping and ordering for overall mode
+const TOOLTIP_LABELS: Record<string, string> = {
+  precision: 'Precision',
+  recall: 'Recall',
+  f1Score: 'F1 Score',
+  accuracy: 'Accuracy',
+};
+const TOOLTIP_ORDER: Record<string, number> = {
+  precision: 0,
+  recall: 1,
+  f1Score: 2,
+  accuracy: 3,
+};
 
 const SHIFT_X = -54; // px to shift series left
 
@@ -129,10 +143,26 @@ const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, exclude
 
   // Common filtered rows by excludedFields
   const filteredRows = useMemo(() => {
-    return rows.filter(r => {
-      const ptr = fieldPathToPointer(r.field_path);
-      return !excludedFields.some(ex => ptr.startsWith(ex));
-    });
+    const computePtr = (fp: string) => fieldPathToPointer(fp);
+    const kept: FieldPerformanceRow[] = [];
+    const dropped: FieldPerformanceRow[] = [];
+    for (const r of rows) {
+      const ptr = computePtr(r.field_path);
+      const excluded = excludedFields.some(ex => ptr.startsWith(ex));
+      (excluded ? dropped : kept).push(r);
+    }
+    try {
+      const logObj = {
+        tag: 'PerformanceChart.Filter',
+        mode,
+        excludedFields,
+        totals: { totalRows: rows.length, keptRows: kept.length, droppedRows: dropped.length },
+        keptPreview: kept.slice(0, 5).map(r => ({ id: r.id, evalId: r.evaluation_id, path: r.field_path, ptr: computePtr(r.field_path) })),
+        droppedPreview: dropped.slice(0, 5).map(r => ({ id: r.id, evalId: r.evaluation_id, path: r.field_path, ptr: computePtr(r.field_path) })),
+      } as const;
+      console.log('PerformanceChart.Filter JSON:\n' + JSON.stringify(logObj, null, 2));
+    } catch {}
+    return kept;
   }, [rows, excludedFields]);
 
   // Overall mode: aggregate per evaluation into overall metrics series
@@ -145,6 +175,15 @@ const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, exclude
       if (new Date(r.created_at) < new Date(cur.ts)) cur.ts = r.created_at;
       evalAgg.set(r.evaluation_id, cur);
     }
+    // Build additional diagnostics per evaluation
+    const byEvalTopLevel: Map<number, Record<string, number>> = new Map();
+    for (const r of filteredRows) {
+      const top = getTopLevelKey(r.field_path);
+      const m = byEvalTopLevel.get(r.evaluation_id) || {};
+      m[top] = (m[top] || 0) + 1;
+      byEvalTopLevel.set(r.evaluation_id, m);
+    }
+
     const rowsOut = Array.from(evalAgg.entries()).map(([evalId, agg]) => {
       const { tp, fp, fn, tn } = agg;
       const precision = tp + fp > 0 ? tp / (tp + fp) : 0;
@@ -152,11 +191,108 @@ const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, exclude
       const f1 = precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : 0;
       const accuracy = tp + fp + fn + tn > 0 ? (tp + tn) / (tp + fp + fn + tn) : 0;
       const label = evalIdToLabel.get(evalId) ?? String(evalId);
-      return { x: label, precision, recall, f1Score: f1, accuracy, timestamp: agg.ts };
+      return { x: label, precision, recall, f1Score: f1, accuracy, timestamp: agg.ts, evalId, counts: { tp, fp, fn, tn }, includedRowCount: (byEvalTopLevel.get(evalId) ? Object.values(byEvalTopLevel.get(evalId)!).reduce((a, b) => a + b, 0) : 0), byTopLevel: byEvalTopLevel.get(evalId) || {} };
     });
     rowsOut.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+    try {
+      const logObj = {
+        tag: 'PerformanceChart.Overall',
+        excludedFields,
+        points: rowsOut.map(r => ({ evalId: r.evalId, x: r.x, counts: r.counts, metrics: { precision: +r.precision.toFixed(6), recall: +r.recall.toFixed(6), f1Score: +r.f1Score.toFixed(6), accuracy: +r.accuracy.toFixed(6) }, includedRowCount: r.includedRowCount, byTopLevel: r.byTopLevel })),
+      } as const;
+      console.log('PerformanceChart.Overall JSON:\n' + JSON.stringify(logObj, null, 2));
+
+      // Delta log: before vs after vs removed
+      const computeCounts = (arr: FieldPerformanceRow[]) => arr.reduce((acc, r) => {
+        acc.tp += r.tp || 0; acc.fp += r.fp || 0; acc.fn += r.fn || 0; acc.tn += r.tn || 0; return acc;
+      }, { tp: 0, fp: 0, fn: 0, tn: 0 });
+      const toMetrics = (c: {tp:number;fp:number;fn:number;tn:number}) => ({
+        precision: c.tp + c.fp > 0 ? c.tp / (c.tp + c.fp) : 0,
+        recall: c.tp + c.fn > 0 ? c.tp / (c.tp + c.fn) : 0,
+        f1Score: (c.tp + c.fp > 0 && c.tp + c.fn > 0) ? ((2 * (c.tp / (c.tp + c.fp)) * (c.tp / (c.tp + c.fn))) / ((c.tp / (c.tp + c.fp)) + (c.tp / (c.tp + c.fn)))) : 0,
+        accuracy: c.tp + c.fp + c.fn + c.tn > 0 ? (c.tp + c.tn) / (c.tp + c.fp + c.fn + c.tn) : 0,
+      });
+      const isExcluded = (ptr: string) => excludedFields.some(ex => ptr.startsWith(ex));
+      const computePtr = (fp: string) => fieldPathToPointer(fp);
+
+      const byEval = new Map<number, { all: FieldPerformanceRow[]; kept: FieldPerformanceRow[]; removed: FieldPerformanceRow[] }>();
+      for (const r of rows) {
+        const e = r.evaluation_id;
+        const ent = byEval.get(e) || { all: [], kept: [], removed: [] };
+        ent.all.push(r);
+        const ptr = computePtr(r.field_path);
+        (isExcluded(ptr) ? ent.removed : ent.kept).push(r);
+        byEval.set(e, ent);
+      }
+      const delta = Array.from(byEval.entries()).map(([evalId, sets]) => {
+        const allCounts = computeCounts(sets.all);
+        const keptCounts = computeCounts(sets.kept);
+        const removedCounts = computeCounts(sets.removed);
+        return {
+          evalId,
+          totals: { allRows: sets.all.length, keptRows: sets.kept.length, removedRows: sets.removed.length },
+          before: { counts: allCounts, metrics: toMetrics(allCounts) },
+          after: { counts: keptCounts, metrics: toMetrics(keptCounts) },
+          removed: { counts: removedCounts, metrics: toMetrics(removedCounts) },
+        };
+      });
+      const deltaLog = { tag: 'PerformanceChart.OverallDelta', excludedFields, evals: delta } as const;
+      console.log('PerformanceChart.OverallDelta JSON:\n' + JSON.stringify(deltaLog, null, 2));
+
+      // Remaining error breakdown per evaluation (which pointers still cause FP/FN?)
+      const errorBreakdown = Array.from(new Set(rowsOut.map(r => r.evalId))).map(evalId => {
+        const keptForEval = filteredRows.filter(r => r.evaluation_id === evalId);
+        const perPtr = new Map<string, { top: string; tp: number; fp: number; fn: number; tn: number }>();
+        for (const r of keptForEval) {
+          const ptr = computePtr(r.field_path);
+          const top = getTopLevelKey(r.field_path);
+          const cur = perPtr.get(ptr) || { top, tp: 0, fp: 0, fn: 0, tn: 0 };
+          cur.tp += r.tp || 0; cur.fp += r.fp || 0; cur.fn += r.fn || 0; cur.tn += r.tn || 0;
+          perPtr.set(ptr, cur);
+        }
+        const items = Array.from(perPtr.entries())
+          .map(([ptr, v]) => ({ ptr, top: v.top, tp: v.tp, fp: v.fp, fn: v.fn, tn: v.tn, errors: (v.fp || 0) + (v.fn || 0) }))
+          .filter(x => x.errors > 0)
+          .sort((a, b) => b.errors - a.errors)
+          .slice(0, 30);
+        const totals = items.reduce((acc, it) => { acc.fp += it.fp; acc.fn += it.fn; return acc; }, { fp: 0, fn: 0 });
+        return { evalId, totals, topPointers: items };
+      });
+      console.log('PerformanceChart.RemainingErrors JSON:\n' + JSON.stringify({ tag: 'PerformanceChart.RemainingErrors', excludedFields, evals: errorBreakdown }, null, 2));
+
+      // If med_name contributes errors, enumerate which medication semantic keys are problematic
+      const medNameErrors = Array.from(new Set(rowsOut.map(r => r.evalId))).map(evalId => {
+        const keptForEval = filteredRows.filter(r => r.evaluation_id === evalId && r.field_path.includes('medications.medications[') && r.field_path.endsWith('.med_name'));
+        const items = keptForEval
+          .map(r => {
+            const m = r.field_path.match(/medications\.medications\[(.*?)\]\.med_name/);
+            const key = m?.[1] || '';
+            const [name, dosage, frequency] = key.split('|');
+            return {
+              field_path: r.field_path,
+              semantic_key: key,
+              name: name || '',
+              dosage: dosage || '',
+              frequency: frequency || '',
+              tp: r.tp || 0,
+              fp: r.fp || 0,
+              fn: r.fn || 0,
+              tn: r.tn || 0,
+              errors: (r.fp || 0) + (r.fn || 0),
+            };
+          })
+          .filter(x => x.errors > 0)
+          .sort((a, b) => b.errors - a.errors)
+          .slice(0, 50);
+        const totals = items.reduce((acc, it) => { acc.fp += it.fp; acc.fn += it.fn; return acc; }, { fp: 0, fn: 0 });
+        return { evalId, totals, items };
+      }).filter(section => section.items.length > 0);
+      if (medNameErrors.length > 0) {
+        console.log('PerformanceChart.MedNameErrors JSON:\n' + JSON.stringify({ tag: 'PerformanceChart.MedNameErrors', excludedFields, evals: medNameErrors }, null, 2));
+      }
+    } catch {}
     return rowsOut;
-  }, [filteredRows, mode, evalIdToLabel]);
+  }, [filteredRows, mode, evalIdToLabel, rows, excludedFields]);
 
   // Field mode: series per top-level section for selected metric
   const fieldData = useMemo(() => {
@@ -192,9 +328,21 @@ const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, exclude
         row[s.key] = val;
         if (typeof val === 'number' && val < minMetric) minMetric = val;
       }
+      row.__debugCounts = Object.fromEntries(Array.from(sectionMap.entries()).map(([k, v]) => [k, { sum: v.sum, count: v.count, avg: +(v.sum / Math.max(1, v.count)).toFixed(6) }]));
+      row.__evalId = evalId;
       return row;
     });
     chartRows.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+    try {
+      const logObj = {
+        tag: 'PerformanceChart.Field',
+        excludedFields,
+        metric: effectiveMetric,
+        series: series.map(s => s.key),
+        points: chartRows.map(r => ({ x: r.x, evalId: r.__evalId, counts: r.__debugCounts })),
+      } as const;
+      console.log('PerformanceChart.Field JSON:\n' + JSON.stringify(logObj, null, 2));
+    } catch {}
     return { data: chartRows, series, minVal: minMetric };
   }, [filteredRows, mode, effectiveMetric, evalIdToLabel]);
 
@@ -232,10 +380,10 @@ const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, exclude
   // Build legend items based on mode
   const legendItems = mode === 'overall'
     ? [
-        { key: 'accuracy', label: 'accuracy', color: chartColors.accuracy },
-        { key: 'f1Score', label: 'f1Score', color: chartColors.f1Score },
         { key: 'precision', label: 'precision', color: chartColors.precision },
         { key: 'recall', label: 'recall', color: chartColors.recall },
+        { key: 'f1Score', label: 'f1Score', color: chartColors.f1Score },
+        { key: 'accuracy', label: 'accuracy', color: chartColors.accuracy },
       ]
     : fieldData.series.map(s => ({ key: s.key, label: s.label, color: s.color }));
 
@@ -275,7 +423,11 @@ const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, exclude
             <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
             <XAxis dataKey={'x'} stroke={axisColor} tick={{ fill: axisColor, fontSize: 10, textAnchor: 'start' }} interval={0} tickMargin={10} angle={18} height={82} scale="band" padding={{ left: 6, right: 30 }} allowDuplicatedCategory={false} tickLine={false} />
             <YAxis stroke={axisColor} tick={{ fill: axisColor }} domain={yDomain} tickFormatter={(value) => `${(value * 100).toFixed(0)}%`} />
-            <Tooltip contentStyle={{ backgroundColor: isDarkMode ? '#1f2937' : '#ffffff', border: `1px solid ${isDarkMode ? '#374151' : '#e5e7eb'}`, borderRadius: '8px', color: textColor }} formatter={(value: number, name: string) => [`${(value * 100).toFixed(1)}%`, name]} />
+            <Tooltip 
+              contentStyle={{ backgroundColor: isDarkMode ? '#1f2937' : '#ffffff', border: `1px solid ${isDarkMode ? '#374151' : '#e5e7eb'}`, borderRadius: '8px', color: textColor }} 
+              formatter={(value: number, name: string) => [`${(value * 100).toFixed(1)}%`, TOOLTIP_LABELS[name] || name]}
+              itemSorter={(item: any) => (mode === 'overall' ? (TOOLTIP_ORDER[item?.name] ?? 999) : 0)}
+            />
             {mode === 'overall' ? (
               <>
                 <Line style={lineShiftStyle} type="monotone" dataKey="precision" stroke={chartColors.precision} strokeWidth={2} dot={{ fill: chartColors.precision, strokeWidth: 2, r: 3 }} activeDot={(p: any) => (

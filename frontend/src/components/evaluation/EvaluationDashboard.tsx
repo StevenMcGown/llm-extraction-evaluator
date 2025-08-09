@@ -4,6 +4,7 @@ import DocumentResultsViewer from './evaluation_results/DocumentResultsViewer';
 import SimilarityLegend, { SimilarityLegendItem } from './evaluation_results/SimilarityLegend';
 import { useSettings } from '../../context/SettingsContext';
 import { runEvaluation, getEvaluationResult, getEvaluationFromS3, listEvaluations, listSourceFiles, recalculateEvaluation } from '../../services/api';
+import { queryTable, getEvaluationMetrics } from '../../services/api';
 // add import after others
 import EvaluationSettings from './evaluation_settings/EvaluationSettings';
 
@@ -255,7 +256,7 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     setDocuments(mappedDocuments);
 
     // Map backend metrics to frontend format
-    setMetrics({
+    const mappedMetrics: EvaluationMetrics = {
       truePositives: result.metrics.true_positives,
       falsePositives: result.metrics.false_positives,
       falseNegatives: result.metrics.false_negatives,
@@ -264,7 +265,8 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
       recall: result.metrics.recall,
       f1Score: result.metrics.f1_score,
       accuracy: result.metrics.accuracy,
-    });
+    };
+    setMetrics(mappedMetrics);
 
     // Generate issues log from all document mismatches
     const allMismatches = mappedDocuments.flatMap(doc => {
@@ -275,8 +277,180 @@ const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({ isDarkMode, s
     });
     setCalculationLog(allMismatches);
 
+    // Recompute metrics from DB rows (field_performance) like the dashboard, so both views match
+    recomputeMetricsFromDb(result.evaluation_id, excludedFields).catch(() => {});
+
+    // Emit structured logs similar to dashboard
+    try {
+      const toPointer = (fieldPath: string) => {
+        let ptr = fieldPath.replace(/\[.*?\]/g, '');
+        ptr = ptr.replace(/\./g, '/');
+        if (!ptr.startsWith('/')) ptr = '/' + ptr;
+        return ptr;
+      };
+      const isExcluded = (ptr: string) => excludedFields.some(ex => ptr.startsWith(ex));
+      // Prefer last iteration scores if available; otherwise use doc.scores
+      const selectScores = (doc: DocumentResult): Record<string, number> => {
+        if (doc.iteration_scores && doc.iteration_scores.length > 0) {
+          return doc.iteration_scores[doc.iteration_scores.length - 1] as Record<string, number>;
+        }
+        return doc.scores || {};
+      };
+      // Build per-pointer counts from scores using same thresholds as backend
+      type Cnts = { tp: number; fp: number; fn: number; tn: number };
+      const perPtr: Map<string, Cnts> = new Map();
+      for (const doc of mappedDocuments) {
+        const scores = selectScores(doc);
+        for (const [fieldPath, score] of Object.entries(scores)) {
+          const ptr = toPointer(fieldPath);
+          if (isExcluded(ptr)) continue;
+          const cur = perPtr.get(ptr) || { tp: 0, fp: 0, fn: 0, tn: 0 };
+          if (score >= 0.99) cur.tp += 1;
+          else if (score === -1.0) cur.fp += 1;
+          else if (score === -2.0) cur.fn += 1;
+          else if (score > 0.0) cur.tp += 1; // partial -> TP
+          perPtr.set(ptr, cur);
+        }
+      }
+      // Overall log
+      console.log('EvaluationPage.Overall JSON\n' + JSON.stringify({
+        tag: 'EvaluationPage.Overall',
+        excludedFields,
+        counts: {
+          tp: mappedMetrics.truePositives,
+          fp: mappedMetrics.falsePositives,
+          fn: mappedMetrics.falseNegatives,
+          tn: mappedMetrics.trueNegatives,
+        },
+        metrics: {
+          precision: +mappedMetrics.precision.toFixed(6),
+          recall: +mappedMetrics.recall.toFixed(6),
+          f1Score: +mappedMetrics.f1Score.toFixed(6),
+          accuracy: +mappedMetrics.accuracy.toFixed(6),
+        }
+      }, null, 2));
+
+      // Remaining errors per pointer
+      const errorItems = Array.from(perPtr.entries())
+        .map(([ptr, c]) => ({ ptr, tp: c.tp, fp: c.fp, fn: c.fn, tn: c.tn, errors: (c.fp || 0) + (c.fn || 0) }))
+        .filter(x => x.errors > 0)
+        .sort((a, b) => b.errors - a.errors)
+        .slice(0, 50);
+      const totals = errorItems.reduce((acc, it) => { acc.fp += it.fp; acc.fn += it.fn; return acc; }, { fp: 0, fn: 0 });
+      console.log('EvaluationPage.RemainingErrors JSON\n' + JSON.stringify({
+        tag: 'EvaluationPage.RemainingErrors',
+        excludedFields,
+        totals,
+        topPointers: errorItems
+      }, null, 2));
+
+      // MedNameErrors like dashboard
+      const medNameItems = errorItems.filter(it => it.ptr.includes('/medications/medications/') && it.ptr.endsWith('/med_name'));
+      if (medNameItems.length > 0) {
+        // try to derive semantic key from original field path by finding matching pointer
+        const medDetails: any[] = [];
+        for (const doc of mappedDocuments) {
+          const scores = selectScores(doc);
+          for (const fieldPath of Object.keys(scores)) {
+            if (fieldPath.includes('medications.medications[') && fieldPath.endsWith('.med_name')) {
+              const ptr = toPointer(fieldPath);
+              if (isExcluded(ptr)) continue;
+              const m = fieldPath.match(/medications\.medications\[(.*?)\]\.med_name/);
+              const key = m?.[1] || '';
+              const [name, dosage, frequency] = key.split('|');
+              const cnt = perPtr.get(ptr) || { tp: 0, fp: 0, fn: 0, tn: 0 };
+              if ((cnt.fp || 0) + (cnt.fn || 0) > 0) {
+                medDetails.push({ field_path: fieldPath, semantic_key: key, name: name || '', dosage: dosage || '', frequency: frequency || '', tp: cnt.tp, fp: cnt.fp, fn: cnt.fn, tn: cnt.tn, errors: (cnt.fp || 0) + (cnt.fn || 0) });
+              }
+            }
+          }
+        }
+        console.log('EvaluationPage.MedNameErrors JSON\n' + JSON.stringify({ tag: 'EvaluationPage.MedNameErrors', excludedFields, items: medDetails.slice(0, 50) }, null, 2));
+      }
+    } catch {}
+
     setError(null);
   };
+
+  // Compute metrics from DB rows just like the dashboard (ensures parity)
+  const recomputeMetricsFromDb = async (runId: string | null, excluded: string[]) => {
+    if (!runId) return;
+    // 1) Fetch field_performance rows and evaluation_metrics mapping
+    const [fieldResp, metricsResp] = await Promise.all([
+      queryTable('field_performance', 5000),
+      getEvaluationMetrics(1000),
+    ]);
+    const fieldRows = Array.isArray(fieldResp.data?.data) ? fieldResp.data.data : [];
+    const metricsRows = Array.isArray(metricsResp.data?.metrics) ? metricsResp.data.metrics : [];
+
+    // 2) Map evaluation_metrics.id -> label (file_id or run label), find id for this run
+    const evalIdForRun = (() => {
+      for (const m of metricsRows) {
+        const idNum = Number(m.id);
+        const label = String(m.file_id ?? idNum);
+        if (label === runId) return idNum;
+      }
+      return null;
+    })();
+    if (evalIdForRun == null) return;
+
+    // 3) Filter rows for this evaluation
+    const rowsForEval = fieldRows.filter((r: any) => Number(r.evaluation_id) === evalIdForRun);
+
+    // 4) Apply the same excludedFields filtering by converting field_path to JSON pointer
+    const toPtr = (fieldPath: string) => {
+      let ptr = String(fieldPath || '').replace(/\[.*?\]/g, '');
+      ptr = ptr.replace(/\./g, '/');
+      if (!ptr.startsWith('/')) ptr = '/' + ptr;
+      return ptr;
+    };
+    const filtered = rowsForEval.filter((r: any) => {
+      const ptr = toPtr(String(r.field_path || ''));
+      return !excluded.some(ex => ptr.startsWith(ex));
+    });
+
+    // 5) Sum counts and compute metrics (same as dashboard and backend)
+    const sums = filtered.reduce((acc: any, r: any) => {
+      acc.tp += Number(r.tp ?? 0);
+      acc.fp += Number(r.fp ?? 0);
+      acc.fn += Number(r.fn ?? 0);
+      acc.tn += Number(r.tn ?? 0);
+      return acc;
+    }, { tp: 0, fp: 0, fn: 0, tn: 0 });
+    const precision = (sums.tp + sums.fp) > 0 ? sums.tp / (sums.tp + sums.fp) : 0;
+    const recall = (sums.tp + sums.fn) > 0 ? sums.tp / (sums.tp + sums.fn) : 0;
+    const f1Score = (precision + recall) > 0 ? (2 * precision * recall) / (precision + recall) : 0;
+    const accuracy = (sums.tp + sums.fp + sums.fn + sums.tn) > 0 ? (sums.tp + sums.tn) / (sums.tp + sums.fp + sums.fn + sums.tn) : 0;
+
+    setMetrics({
+      truePositives: sums.tp,
+      falsePositives: sums.fp,
+      falseNegatives: sums.fn,
+      trueNegatives: sums.tn,
+      precision,
+      recall,
+      f1Score,
+      accuracy,
+    });
+
+    try {
+      console.log('EvaluationPage.DBAligned JSON\n' + JSON.stringify({
+        tag: 'EvaluationPage.DBAligned',
+        runId,
+        excludedFields: excluded,
+        counts: sums,
+        metrics: { precision, recall, f1Score, accuracy },
+        rowsUsed: filtered.length,
+      }, null, 2));
+    } catch {}
+  };
+
+  // When exclusions change and we have a current evaluation, recompute metrics from DB rows
+  useEffect(() => {
+    if (currentEvaluationId) {
+      recomputeMetricsFromDb(currentEvaluationId, excludedFields).catch(() => {});
+    }
+  }, [currentEvaluationId, excludedFields]);
 
   const loadEvaluationByRunId = async () => {
     if (!runIdInput.trim()) {

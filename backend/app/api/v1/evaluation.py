@@ -504,7 +504,7 @@ async def seed_ground_truth_from_extraction(
     """Generate ground truth by calling extraction API - seeds the ground truth when it doesn't exist."""
     try:
         # Call extraction API to generate initial ground truth
-        api_response = await call_extraction_api(
+        api_response = await call_extraction_api_async(
             pdf_content, filename, request.extraction_endpoint,
             request.extraction_types, request.oauth_token
         )
@@ -543,41 +543,92 @@ async def seed_ground_truth_from_extraction(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to seed ground truth for {filename}: {str(e)}")
 
-async def call_extraction_api(
-    pdf_content: bytes, 
-    filename: str, 
-    endpoint: str, 
+async def call_extraction_api_async(
+    pdf_content: bytes,
+    filename: str,
+    endpoint: str,
     extraction_types: List[str],
-    oauth_token: Optional[str] = None
+    oauth_token: Optional[str] = None,
+    datacontext: str = 'eval_testing',
+    poll_interval: float = 2.0,
+    timeout_s: int = 600,
 ) -> Dict[str, Any]:
-    """Call the extraction API with PDF content."""
-    
-    # Build URL with query parameters
-    base_url = endpoint.rstrip('/') + '/api/v1/process/'
-    
+    """
+    Asynchronously call the extraction service via upload → status → retrieve.
+
+    - Uploads the PDF and gets a GUID
+    - Polls status until completion or timeout
+    - Retrieves the final result JSON
+    """
+    upload_url = endpoint.rstrip('/') + '/api/v1/upload/'
+    headers = {'accept': 'application/json'}
+    if oauth_token:
+        headers['Authorization'] = f'Bearer {oauth_token}'
+
+    # Build query params
+    params: Dict[str, Any] = {}
+    for ext_type in extraction_types:
+        params.setdefault('extraction_types', []).append(ext_type)
+    params['datacontext'] = datacontext
+
     async with aiohttp.ClientSession() as session:
+        # 1) Upload
         form_data = aiohttp.FormData()
         form_data.add_field('file', pdf_content, filename=filename, content_type='application/pdf')
-        
-        # Add extraction types as query parameters
-        params = {}
-        for ext_type in extraction_types:
-            if 'extraction_types' not in params:
-                params['extraction_types'] = []
-            params['extraction_types'].append(ext_type)
-        params['datacontext'] = 'eval_test'
-        
-        headers = {'accept': 'application/json'}
-        if oauth_token:
-            headers['Authorization'] = f'Bearer {oauth_token}'
-            
-        async with session.post(base_url, data=form_data, headers=headers, params=params) as response:
-            if response.status != 200:
-                raise HTTPException(
-                    status_code=response.status, 
-                    detail=f"Extraction API failed: {response.status} {await response.text()}"
-                )
-            return await response.json()
+        async with session.post(upload_url, data=form_data, headers=headers, params=params) as upload_resp:
+            if upload_resp.status not in (200, 202):
+                raise HTTPException(status_code=upload_resp.status, detail=f"Upload failed: {upload_resp.status} {await upload_resp.text()}")
+            upload_body = await upload_resp.json()
+            guid = (
+                upload_body.get('guid')
+                or upload_body.get('id')
+                or upload_body.get('job_id')
+                or upload_body.get('task_id')
+                or upload_body.get('JobId')
+            )
+            if not guid:
+                # Case-insensitive fallback
+                for k, v in upload_body.items():
+                    if isinstance(k, str) and k.lower() in {'guid', 'id', 'job_id', 'task_id', 'jobid'}:
+                        guid = v
+                        break
+            if not guid:
+                raise HTTPException(status_code=500, detail=f"Upload response missing GUID: {upload_body}")
+
+        # 2) Poll status
+        status_url = endpoint.rstrip('/') + f'/api/v1/status/{guid}'
+        retrieve_url = endpoint.rstrip('/') + f'/api/v1/retrieve/{guid}'
+
+        start_ts = time.time()
+        attempt = 0
+        last_status_text = ''
+        while True:
+            attempt += 1
+            async with session.get(status_url, headers=headers) as status_resp:
+                if status_resp.status != 200:
+                    # Treat non-200 as transient for a short while
+                    text = await status_resp.text()
+                    last_status_text = f"HTTP {status_resp.status}: {text}"
+                else:
+                    status_body = await status_resp.json()
+                    status_value = str(status_body.get('status', '')).lower()
+                    # Accept a few common completion labels
+                    if status_value in {'completed', 'complete', 'done', 'finished', 'success'}:
+                        break
+                    if status_value in {'failed', 'error'}:
+                        raise HTTPException(status_code=500, detail=f"Extraction failed for {filename}: {status_body}")
+                    last_status_text = status_value or str(status_body)
+
+            if time.time() - start_ts > timeout_s:
+                raise HTTPException(status_code=504, detail=f"Timed out after {timeout_s}s waiting for extraction of {filename}. Last status: {last_status_text}")
+
+            await asyncio.sleep(poll_interval)
+
+        # 3) Retrieve
+        async with session.get(retrieve_url, headers=headers) as retrieve_resp:
+            if retrieve_resp.status != 200:
+                raise HTTPException(status_code=retrieve_resp.status, detail=f"Retrieve failed: {retrieve_resp.status} {await retrieve_resp.text()}")
+            return await retrieve_resp.json()
 
 def normalize_value_for_comparison(value: Any) -> str:
     """Convert any value to a normalized lowercase string for comparison."""
@@ -1076,7 +1127,7 @@ async def run_evaluation_task(evaluation_id: str, request: EvaluationRequest):
                     for iteration in range(request.iterations):
                         try:
                             logger.info(f"Evaluation {evaluation_id}: Starting iteration {iteration + 1}/{request.iterations} for {filename} (current progress: {result.completed_iterations}/{result.total_iterations})")
-                            api_response = await call_extraction_api(
+                            api_response = await call_extraction_api_async(
                                 pdf_content, filename, request.extraction_endpoint,
                                 request.extraction_types, request.oauth_token
                             )
