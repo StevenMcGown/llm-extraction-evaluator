@@ -77,7 +77,7 @@ const TOOLTIP_ORDER: Record<string, number> = {
   accuracy: 3,
 };
 
-const SHIFT_X = -54; // px to shift series left
+
 
 const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, excludedFields = [], mode, selectedMetric, onMetricChange }) => {
   const [rows, setRows] = useState<FieldPerformanceRow[]>([]);
@@ -151,17 +151,6 @@ const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, exclude
       const excluded = excludedFields.some(ex => ptr.startsWith(ex));
       (excluded ? dropped : kept).push(r);
     }
-    try {
-      const logObj = {
-        tag: 'PerformanceChart.Filter',
-        mode,
-        excludedFields,
-        totals: { totalRows: rows.length, keptRows: kept.length, droppedRows: dropped.length },
-        keptPreview: kept.slice(0, 5).map(r => ({ id: r.id, evalId: r.evaluation_id, path: r.field_path, ptr: computePtr(r.field_path) })),
-        droppedPreview: dropped.slice(0, 5).map(r => ({ id: r.id, evalId: r.evaluation_id, path: r.field_path, ptr: computePtr(r.field_path) })),
-      } as const;
-      console.log('PerformanceChart.Filter JSON:\n' + JSON.stringify(logObj, null, 2));
-    } catch {}
     return kept;
   }, [rows, excludedFields]);
 
@@ -194,102 +183,17 @@ const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, exclude
       return { x: label, precision, recall, f1Score: f1, accuracy, timestamp: agg.ts, evalId, counts: { tp, fp, fn, tn }, includedRowCount: (byEvalTopLevel.get(evalId) ? Object.values(byEvalTopLevel.get(evalId)!).reduce((a, b) => a + b, 0) : 0), byTopLevel: byEvalTopLevel.get(evalId) || {} };
     });
     rowsOut.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+    // Log concise TN/TP/FN/FP for the latest (most recent) overall run
+    const latest = rowsOut[rowsOut.length - 1];
+    if (latest && latest.counts) {
+      const { tp, fp, fn, tn } = latest.counts as any;
+      // Keep this concise as requested
+      console.log(`Overall latest run (evalId=${latest.evalId}) counts -> TP:${tp} FP:${fp} FN:${fn} TN:${tn}`);
+    }
+
     try {
-      const logObj = {
-        tag: 'PerformanceChart.Overall',
-        excludedFields,
-        points: rowsOut.map(r => ({ evalId: r.evalId, x: r.x, counts: r.counts, metrics: { precision: +r.precision.toFixed(6), recall: +r.recall.toFixed(6), f1Score: +r.f1Score.toFixed(6), accuracy: +r.accuracy.toFixed(6) }, includedRowCount: r.includedRowCount, byTopLevel: r.byTopLevel })),
-      } as const;
-      console.log('PerformanceChart.Overall JSON:\n' + JSON.stringify(logObj, null, 2));
-
-      // Delta log: before vs after vs removed
-      const computeCounts = (arr: FieldPerformanceRow[]) => arr.reduce((acc, r) => {
-        acc.tp += r.tp || 0; acc.fp += r.fp || 0; acc.fn += r.fn || 0; acc.tn += r.tn || 0; return acc;
-      }, { tp: 0, fp: 0, fn: 0, tn: 0 });
-      const toMetrics = (c: {tp:number;fp:number;fn:number;tn:number}) => ({
-        precision: c.tp + c.fp > 0 ? c.tp / (c.tp + c.fp) : 0,
-        recall: c.tp + c.fn > 0 ? c.tp / (c.tp + c.fn) : 0,
-        f1Score: (c.tp + c.fp > 0 && c.tp + c.fn > 0) ? ((2 * (c.tp / (c.tp + c.fp)) * (c.tp / (c.tp + c.fn))) / ((c.tp / (c.tp + c.fp)) + (c.tp / (c.tp + c.fn)))) : 0,
-        accuracy: c.tp + c.fp + c.fn + c.tn > 0 ? (c.tp + c.tn) / (c.tp + c.fp + c.fn + c.tn) : 0,
-      });
-      const isExcluded = (ptr: string) => excludedFields.some(ex => ptr.startsWith(ex));
-      const computePtr = (fp: string) => fieldPathToPointer(fp);
-
-      const byEval = new Map<number, { all: FieldPerformanceRow[]; kept: FieldPerformanceRow[]; removed: FieldPerformanceRow[] }>();
-      for (const r of rows) {
-        const e = r.evaluation_id;
-        const ent = byEval.get(e) || { all: [], kept: [], removed: [] };
-        ent.all.push(r);
-        const ptr = computePtr(r.field_path);
-        (isExcluded(ptr) ? ent.removed : ent.kept).push(r);
-        byEval.set(e, ent);
-      }
-      const delta = Array.from(byEval.entries()).map(([evalId, sets]) => {
-        const allCounts = computeCounts(sets.all);
-        const keptCounts = computeCounts(sets.kept);
-        const removedCounts = computeCounts(sets.removed);
-        return {
-          evalId,
-          totals: { allRows: sets.all.length, keptRows: sets.kept.length, removedRows: sets.removed.length },
-          before: { counts: allCounts, metrics: toMetrics(allCounts) },
-          after: { counts: keptCounts, metrics: toMetrics(keptCounts) },
-          removed: { counts: removedCounts, metrics: toMetrics(removedCounts) },
-        };
-      });
-      const deltaLog = { tag: 'PerformanceChart.OverallDelta', excludedFields, evals: delta } as const;
-      console.log('PerformanceChart.OverallDelta JSON:\n' + JSON.stringify(deltaLog, null, 2));
-
-      // Remaining error breakdown per evaluation (which pointers still cause FP/FN?)
-      const errorBreakdown = Array.from(new Set(rowsOut.map(r => r.evalId))).map(evalId => {
-        const keptForEval = filteredRows.filter(r => r.evaluation_id === evalId);
-        const perPtr = new Map<string, { top: string; tp: number; fp: number; fn: number; tn: number }>();
-        for (const r of keptForEval) {
-          const ptr = computePtr(r.field_path);
-          const top = getTopLevelKey(r.field_path);
-          const cur = perPtr.get(ptr) || { top, tp: 0, fp: 0, fn: 0, tn: 0 };
-          cur.tp += r.tp || 0; cur.fp += r.fp || 0; cur.fn += r.fn || 0; cur.tn += r.tn || 0;
-          perPtr.set(ptr, cur);
-        }
-        const items = Array.from(perPtr.entries())
-          .map(([ptr, v]) => ({ ptr, top: v.top, tp: v.tp, fp: v.fp, fn: v.fn, tn: v.tn, errors: (v.fp || 0) + (v.fn || 0) }))
-          .filter(x => x.errors > 0)
-          .sort((a, b) => b.errors - a.errors)
-          .slice(0, 30);
-        const totals = items.reduce((acc, it) => { acc.fp += it.fp; acc.fn += it.fn; return acc; }, { fp: 0, fn: 0 });
-        return { evalId, totals, topPointers: items };
-      });
-      console.log('PerformanceChart.RemainingErrors JSON:\n' + JSON.stringify({ tag: 'PerformanceChart.RemainingErrors', excludedFields, evals: errorBreakdown }, null, 2));
-
-      // If med_name contributes errors, enumerate which medication semantic keys are problematic
-      const medNameErrors = Array.from(new Set(rowsOut.map(r => r.evalId))).map(evalId => {
-        const keptForEval = filteredRows.filter(r => r.evaluation_id === evalId && r.field_path.includes('medications.medications[') && r.field_path.endsWith('.med_name'));
-        const items = keptForEval
-          .map(r => {
-            const m = r.field_path.match(/medications\.medications\[(.*?)\]\.med_name/);
-            const key = m?.[1] || '';
-            const [name, dosage, frequency] = key.split('|');
-            return {
-              field_path: r.field_path,
-              semantic_key: key,
-              name: name || '',
-              dosage: dosage || '',
-              frequency: frequency || '',
-              tp: r.tp || 0,
-              fp: r.fp || 0,
-              fn: r.fn || 0,
-              tn: r.tn || 0,
-              errors: (r.fp || 0) + (r.fn || 0),
-            };
-          })
-          .filter(x => x.errors > 0)
-          .sort((a, b) => b.errors - a.errors)
-          .slice(0, 50);
-        const totals = items.reduce((acc, it) => { acc.fp += it.fp; acc.fn += it.fn; return acc; }, { fp: 0, fn: 0 });
-        return { evalId, totals, items };
-      }).filter(section => section.items.length > 0);
-      if (medNameErrors.length > 0) {
-        console.log('PerformanceChart.MedNameErrors JSON:\n' + JSON.stringify({ tag: 'PerformanceChart.MedNameErrors', excludedFields, evals: medNameErrors }, null, 2));
-      }
+      // no-op: suppress verbose diagnostic logging in production UI
     } catch {}
     return rowsOut;
   }, [filteredRows, mode, evalIdToLabel, rows, excludedFields]);
@@ -334,14 +238,7 @@ const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, exclude
     });
     chartRows.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
     try {
-      const logObj = {
-        tag: 'PerformanceChart.Field',
-        excludedFields,
-        metric: effectiveMetric,
-        series: series.map(s => s.key),
-        points: chartRows.map(r => ({ x: r.x, evalId: r.__evalId, counts: r.__debugCounts })),
-      } as const;
-      console.log('PerformanceChart.Field JSON:\n' + JSON.stringify(logObj, null, 2));
+      // no-op: suppress verbose diagnostic logging in production UI
     } catch {}
     return { data: chartRows, series, minVal: minMetric };
   }, [filteredRows, mode, effectiveMetric, evalIdToLabel]);
@@ -367,8 +264,8 @@ const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, exclude
   const textColor = isDarkMode ? '#ffffff' : '#111827';
   const axisColor = isDarkMode ? '#9ca3af' : '#6b7280';
 
-  // Style to shift the entire line (path + default dots) left without moving the grid
-  const lineShiftStyle = { transform: `translateX(${SHIFT_X}px)` } as const;
+  // No more shifting needed - grid and data points are now properly aligned
+  const lineShiftStyle = {} as const;
 
   if (loading) {
     return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 320, color: axisColor, fontSize: '1rem' }}>Loading performance data...</div>;
@@ -404,24 +301,27 @@ const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, exclude
       )}
       
       <div style={{ position: 'relative', width: '100%' }}>
-        {/* Legend positioned inside chart at top-right */}
-        <div style={{ 
-          position: 'absolute', 
-          top: 16, 
-          right: 16, 
-          zIndex: 10,
-          backgroundColor: isDarkMode ? 'rgba(31, 41, 55, 0.9)' : 'rgba(255, 255, 255, 0.9)',
-          borderRadius: 6,
-          padding: '8px 12px',
-          border: `1px solid ${isDarkMode ? '#374151' : '#e5e7eb'}`
-        }}>
+        {/* Legend above the chart */}
+        <div style={{ marginBottom: 8 }}>
           <LegendList items={legendItems} isDarkMode={isDarkMode} />
         </div>
         
         <ResponsiveContainer width="100%" height={320}>
           <LineChart data={mode === 'overall' ? overallData : fieldData.data} margin={{ top: 8, right: 12, left: 6, bottom: 18 }}>
             <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
-            <XAxis dataKey={'x'} stroke={axisColor} tick={{ fill: axisColor, fontSize: 10, textAnchor: 'start' }} interval={0} tickMargin={10} angle={18} height={82} scale="band" padding={{ left: 6, right: 30 }} allowDuplicatedCategory={false} tickLine={false} />
+            <XAxis 
+              dataKey={'x'} 
+              stroke={axisColor} 
+              tick={{ fill: axisColor, fontSize: 10, textAnchor: 'middle' }} 
+              interval={0} 
+              tickMargin={10} 
+              angle={18} 
+              height={82} 
+              scale="point" 
+              padding={{ left: 20, right: 20 }} 
+              allowDuplicatedCategory={false} 
+              tickLine={false} 
+            />
             <YAxis stroke={axisColor} tick={{ fill: axisColor }} domain={yDomain} tickFormatter={(value) => `${(value * 100).toFixed(0)}%`} />
             <Tooltip 
               contentStyle={{ backgroundColor: isDarkMode ? '#1f2937' : '#ffffff', border: `1px solid ${isDarkMode ? '#374151' : '#e5e7eb'}`, borderRadius: '8px', color: textColor }} 
@@ -431,22 +331,22 @@ const PerformanceChart: React.FC<PerformanceChartProps> = ({ isDarkMode, exclude
             {mode === 'overall' ? (
               <>
                 <Line style={lineShiftStyle} type="monotone" dataKey="precision" stroke={chartColors.precision} strokeWidth={2} dot={{ fill: chartColors.precision, strokeWidth: 2, r: 3 }} activeDot={(p: any) => (
-                  <circle cx={(p?.cx ?? 0) + SHIFT_X} cy={p?.cy ?? 0} r={5} fill={chartColors.precision} stroke={chartColors.precision} />
+                  <circle cx={p?.cx ?? 0} cy={p?.cy ?? 0} r={5} fill={chartColors.precision} stroke={chartColors.precision} />
                 )} isAnimationActive={true} animationDuration={400} animationEasing="ease-out" />
                 <Line style={lineShiftStyle} type="monotone" dataKey="recall" stroke={chartColors.recall} strokeWidth={2} dot={{ fill: chartColors.recall, strokeWidth: 2, r: 3 }} activeDot={(p: any) => (
-                  <circle cx={(p?.cx ?? 0) + SHIFT_X} cy={p?.cy ?? 0} r={5} fill={chartColors.recall} stroke={chartColors.recall} />
+                  <circle cx={p?.cx ?? 0} cy={p?.cy ?? 0} r={5} fill={chartColors.recall} stroke={chartColors.recall} />
                 )} isAnimationActive={true} animationDuration={400} animationEasing="ease-out" />
                 <Line style={lineShiftStyle} type="monotone" dataKey="f1Score" stroke={chartColors.f1Score} strokeWidth={2} dot={{ fill: chartColors.f1Score, strokeWidth: 2, r: 3 }} activeDot={(p: any) => (
-                  <circle cx={(p?.cx ?? 0) + SHIFT_X} cy={p?.cy ?? 0} r={5} fill={chartColors.f1Score} stroke={chartColors.f1Score} />
+                  <circle cx={p?.cx ?? 0} cy={p?.cy ?? 0} r={5} fill={chartColors.f1Score} stroke={chartColors.f1Score} />
                 )} isAnimationActive={true} animationDuration={400} animationEasing="ease-out" />
-                <Line style={lineShiftStyle} type="monotone" dataKey="accuracy" stroke={chartColors.accuracy} strokeWidth={2} dot={{ fill: chartColors.accuracy, strokeWidth: 2, r: 3 }} activeDot={(p: any) => (
-                  <circle cx={(p?.cx ?? 0) + SHIFT_X} cy={p?.cy ?? 0} r={5} fill={chartColors.accuracy} stroke={chartColors.accuracy} />
-                )} isAnimationActive={true} animationDuration={400} animationEasing="ease-out" />
+                                 <Line style={lineShiftStyle} type="monotone" dataKey="accuracy" stroke={chartColors.accuracy} strokeWidth={2} dot={{ fill: chartColors.accuracy, strokeWidth: 2, r: 3 }} activeDot={(p: any) => (
+                   <circle cx={p?.cx ?? 0} cy={p?.cy ?? 0} r={5} fill={chartColors.accuracy} stroke={chartColors.accuracy} />
+                 )} isAnimationActive={true} animationDuration={400} animationEasing="ease-out" />
               </>
             ) : (
               fieldData.series.map((s) => (
                 <Line key={s.key} style={lineShiftStyle} type="monotone" dataKey={s.key} stroke={s.color} strokeWidth={2} dot={{ fill: s.color, strokeWidth: 2, r: 3 }} activeDot={(p: any) => (
-                  <circle cx={(p?.cx ?? 0) + SHIFT_X} cy={p?.cy ?? 0} r={4} fill={s.color} stroke={s.color} />
+                  <circle cx={p?.cx ?? 0} cy={p?.cy ?? 0} r={4} fill={s.color} stroke={s.color} />
                 )} name={s.label} isAnimationActive={true} animationDuration={400} animationEasing="ease-out" />
               ))
             )}
@@ -461,7 +361,7 @@ function LegendList({ items, isDarkMode }: { items: { key: string; label: string
   const text = isDarkMode ? '#ffffff' : '#111827';
   const muted = isDarkMode ? '#9ca3af' : '#6b7280';
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 20, alignItems: 'flex-start' }}>
+    <div style={{ display: 'flex', flexDirection: 'row', gap: 16, alignItems: 'center', flexWrap: 'wrap' }}>
       {items.map((it) => (
         <div key={it.key} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 9999, backgroundColor: it.color }} />
