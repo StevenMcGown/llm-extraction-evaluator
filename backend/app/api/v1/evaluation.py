@@ -20,7 +20,7 @@ from .db import _pool, _vars
 from ...services.comparison_service import EvaluationMetrics, calculate_overall_metrics
 from ...services.storage_service import parse_s3_uri, get_file_hash_from_key, s3_client
 from ...services.evaluation_runner_service import (
-    generate_evaluation_run_id, run_evaluation_task, evaluation_lock,
+    generate_evaluation_run_id, run_evaluation_task,
     seed_ground_truth_from_extraction
 )
 from ...services.history_service import (
@@ -107,12 +107,8 @@ async def run_evaluation(request: EvaluationRequest, background_tasks: Backgroun
     # Generate evaluation run ID upfront (this will be used consistently)
     evaluation_run_id = generate_evaluation_run_id()
     
-    # Check if evaluation lock is currently held
-    lock_acquired = evaluation_lock.locked()
-    if lock_acquired:
-        logger.info(f"Evaluation {evaluation_run_id} queued - another evaluation is currently running")
-    else:
-        logger.info(f"Evaluation {evaluation_run_id} starting - no queue")
+    # No global lock; start immediately and mark as running
+    logger.info(f"Evaluation {evaluation_run_id} starting")
     
     # Calculate total iterations upfront for proper progress tracking
     # We need to estimate the number of files that will be processed
@@ -130,7 +126,7 @@ async def run_evaluation(request: EvaluationRequest, background_tasks: Backgroun
     # Initialize evaluation result using evaluation_run_id as key
     evaluation_store[evaluation_run_id] = EvaluationResult(
         evaluation_id=evaluation_run_id,
-        status="queued" if lock_acquired else "running",
+        status="running",
         documents=[],
         metrics=EvaluationMetrics(
             true_positives=0, false_positives=0, false_negatives=0, true_negatives=0,
@@ -150,9 +146,9 @@ async def run_evaluation(request: EvaluationRequest, background_tasks: Backgroun
     background_tasks.add_task(run_evaluation_task, evaluation_run_id, request, evaluation_store)
     
     return {
-        "evaluation_id": evaluation_run_id, 
-        "status": "queued" if lock_acquired else "started",
-        "message": "Evaluation queued - another evaluation is running" if lock_acquired else "Evaluation started"
+        "evaluation_id": evaluation_run_id,
+        "status": "started",
+        "message": "Evaluation started"
     }
 
 @router.post("/test-progress/", tags=["debug"])
@@ -226,7 +222,8 @@ async def debug_evaluation_store():
 async def get_evaluation_status():
     """Get the current status of the evaluation system (running/queue info)."""
     
-    lock_held = evaluation_lock.locked()
+    # With no global lock, report running/queued based on stored statuses only
+    lock_held = False
     running_evaluations = []
     queued_evaluations = []
     
