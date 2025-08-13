@@ -316,7 +316,23 @@ def compare_extraction_results(
     true_negatives = 0
 
     gt_flat = flatten_json_for_comparison(ground_truth)
-    api_flat = flatten_json_for_comparison(api_response.get("extracted_data", {}))
+    api_flat_raw = flatten_json_for_comparison(api_response.get("extracted_data", {}))
+
+    # Treat empty strings from API as null/missing to avoid counting FP/FN for "" values
+    api_flat: Dict[str, Any] = {}
+    for k, v in api_flat_raw.items():
+        # Drop scalar empty strings entirely (treat as missing)
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        # For lists, remove empty-string items
+        if isinstance(v, list):
+            cleaned_list = []
+            for item in v:
+                if isinstance(item, str) and item.strip() == "":
+                    continue
+                cleaned_list.append(item)
+            v = cleaned_list
+        api_flat[k] = v
     all_keys = set(gt_flat) | set(api_flat)
 
     for key in all_keys:
@@ -454,4 +470,4 @@ def calculate_overall_metrics(all_scores: List[Dict[str, float]]) -> EvaluationM
         recall=recall,
         f1_score=f1_score,
         accuracy=accuracy
-    ) 
+    )
